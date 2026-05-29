@@ -1,10 +1,57 @@
 <script>
+	// TODO notes:
+	// When hovering the image, I want to show a cloud of only colors in the hover zone
+
 	import { run } from 'svelte/legacy';
 
 	import { onMount, onDestroy } from 'svelte';
+	import tgpu from 'typegpu';
+	import * as d from 'typegpu/data';
 	import beeCloseImg from '$lib/assets/bee_close.jpg';
 	import flowerImg from '$lib/assets/flower.jpg';
 	import pastelsImg from '$lib/assets/pastels.jpg';
+
+	// ── TypeGPU typed uniform schemas ─────────────────────────────────────────
+	// d.struct() mirrors the WGSL uniform structs; TypeGPU enforces vec3f 16-byte
+	// alignment automatically, matching WGSL layout rules exactly.
+	const CameraStruct = d.struct({
+		yaw: d.f32,
+		pitch: d.f32,
+		radius: d.f32,
+		aspect: d.f32,
+		weightMin: d.f32,
+		weightMax: d.f32,
+		hoverEnabled: d.f32,
+		hoverThreshold: d.f32,
+		hoveredColor: d.vec3f,
+		colorSpace: d.f32,
+		lutSize: d.f32,
+		steps: d.f32,
+		_pad1: d.f32,
+		_pad2: d.f32
+	});
+
+	// 96-byte struct matching HighlightUniforms in imgPreviewFragWGSL.
+	const HighlightStruct = d.struct({
+		hoveredColor: d.vec3f,
+		threshold: d.f32,
+		enabled: d.u32,
+		colorSpace: d.u32,
+		flattenWeight: d.f32,
+		contrast: d.f32,
+		cloudCenter: d.vec3f,
+		saturation: d.f32,
+		cameraNormal: d.vec3f,
+		avgL: d.f32,
+		rotation: d.f32,
+		targetHue: d.f32,
+		hueWeight: d.f32,
+		targetChroma: d.f32,
+		chromaWeight: d.f32,
+		_pad3: d.f32,
+		_pad4: d.f32,
+		_pad5: d.f32
+	});
 
 	const presets = [
 		{ name: 'Bee', src: beeCloseImg },
@@ -55,8 +102,8 @@
 	let targetChroma = $state(0.1);
 	let chromaWeight = $state(0.0);
 
-	let lastBuiltYaw = null,
-		lastBuiltPitch = null,
+	let lastBuiltYaw: number | null = null,
+		lastBuiltPitch: number | null = null,
 		lastBuiltFlatten = 1.0,
 		lastBuiltEnableFlattening = true;
 	let lastBuiltContrast = 1.0,
@@ -89,33 +136,33 @@
 	let imgPreviewCanvas = $state();
 
 	// ── GPU handles ───────────────────────────────────────────────────────────
-	let device, canvasCtx, canvasFormat;
-	let animationId;
-	let renderPipeline, sampler;
-	let renderBindGroup;
-	let computePipeline; // Reused compute pipeline
-	let checkerTexture;
-	let colorTex3D;
-	let cameraBuffer;
+	// `root` is the TypeGPU root — it wraps GPUDevice and manages typed resources.
+	let root: any; // TgpuRoot
+	let device: GPUDevice; // root.device shortcut set in init()
+	let canvasCtx: GPUCanvasContext, canvasFormat: GPUTextureFormat;
+	let animationId: number;
+	let renderPipeline: any, sampler: GPUSampler;
+	let renderBindGroup: any;
+	let computePipeline: any;
+	let checkerTexture: GPUTexture; // raw GPUTexture (writeTexture needs raw handle)
+	let colorTex3D: GPUTexture; // raw GPUTexture (3D LUT — rebuilt on LUT size change)
 
-	// Pre-allocated arrays for uniforms to avoid GC pressure
-	const cameraUniformData = new Float32Array(16);
-	const imgPreviewUniformData = new ArrayBuffer(96);
-	const imgPreviewU32 = new Uint32Array(imgPreviewUniformData);
-	const imgPreviewF32 = new Float32Array(imgPreviewUniformData);
+	// TypeGPU typed uniform buffers — write() replaces manual Float32Array indexing.
+	let cameraUniform: any; // TgpuUniform<CameraStruct>
+	let hlUniform: any; // TgpuUniform<HighlightStruct>
 
-	// MRT: color-pick render target + staging buffer
-	let colorPickTexture;
-	let colorPickStagingBuf;
+	// MRT: color-pick render target + staging buffer (raw — needs RENDER_ATTACHMENT)
+	let colorPickTexture: GPUTexture;
+	let colorPickStagingBuf: GPUBuffer;
 
 	// Image preview GPU handles
-	let imgTexture;
-	let imgPreviewCtx, imgPreviewFormat;
-	let imgPreviewPipeline, imgPreviewBindGroup;
-	let imgPreviewUniformBuf;
+	let imgTexture: GPUTexture;
+	let imgPreviewCtx: GPUCanvasContext, imgPreviewFormat: GPUTextureFormat;
+	let imgPreviewPipeline: any, imgPreviewBindGroup: any;
+	// hlUniform doubles as the image-preview highlight uniform buffer (same struct)
 
 	// Keep the last loaded imageData so we can rebuild on LUT change
-	let lastImageData = null;
+	let lastImageData: ImageData | null = null;
 
 	// Dynamic resolution
 	let renderSteps = 128;
@@ -765,6 +812,9 @@
 	}
 
 	function buildBindGroups() {
+		// Group 0: checker texture + sampler (static, no TypeGPU uniform here)
+		// Group 1: 3D LUT + camera uniform — cameraUniform is a TypeGPU TgpuUniform;
+		//          root.unwrap() extracts the underlying GPUBuffer for the raw bind group.
 		renderBindGroup = [
 			device.createBindGroup({
 				layout: renderPipeline.getBindGroupLayout(0),
@@ -776,11 +826,10 @@
 			device.createBindGroup({
 				layout: renderPipeline.getBindGroupLayout(1),
 				entries: [
-					{
-						binding: 0,
-						resource: colorTex3D.createView({ dimension: '3d' })
-					},
-					{ binding: 1, resource: { buffer: cameraBuffer } }
+					{ binding: 0, resource: colorTex3D.createView({ dimension: '3d' }) },
+					// .buffer extracts the TgpuBuffer from the TgpuUniform shorthand;
+					// root.unwrap() then converts it to the raw GPUBuffer.
+					{ binding: 1, resource: { buffer: root.unwrap(cameraUniform.buffer) } }
 				]
 			})
 		];
@@ -793,13 +842,17 @@
 			webgpuError = 'WebGPU is not supported. Please use Chrome 113+ or Edge 113+.';
 			return;
 		}
-		const adapter = await navigator.gpu.requestAdapter();
-		if (!adapter) {
+
+		// tgpu.init() requests an adapter + device internally and returns a TgpuRoot.
+		// root.device exposes the raw GPUDevice for operations not yet abstracted by TypeGPU.
+		try {
+			root = await tgpu.init();
+		} catch (e) {
 			webgpuSupported = false;
-			webgpuError = 'No WebGPU adapter found.';
+			webgpuError = String(e);
 			return;
 		}
-		device = await adapter.requestDevice();
+		device = root.device;
 
 		const canvas = document.getElementById('main-canvas');
 		canvas.width = CANVAS_W;
@@ -808,7 +861,7 @@
 		canvasFormat = navigator.gpu.getPreferredCanvasFormat();
 		canvasCtx.configure({ device, format: canvasFormat });
 
-		// Checkerboard
+		// Checkerboard texture (raw — we need writeTexture which works on GPUTexture)
 		checkerTexture = device.createTexture({
 			size: [CANVAS_W, CANVAS_H],
 			format: 'rgba8unorm',
@@ -821,18 +874,16 @@
 			[CANVAS_W, CANVAS_H]
 		);
 
-		// Camera uniform buffer (16 × f32 = 64 bytes)
-		cameraBuffer = device.createBuffer({
-			size: 64,
-			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-		});
+		// TypeGPU typed uniform for camera — .write() uses the CameraStruct schema,
+		// so field names are checked at compile time instead of raw float indices.
+		cameraUniform = root.createUniform(CameraStruct);
 
-		sampler = device.createSampler({
-			magFilter: 'linear',
-			minFilter: 'linear'
-		});
+		// TypeGPU typed uniform for image-preview highlight parameters.
+		hlUniform = root.createUniform(HighlightStruct);
 
-		// MRT: color-pick render target
+		sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+
+		// MRT: color-pick render target (raw — needs RENDER_ATTACHMENT)
 		colorPickTexture = device.createTexture({
 			size: [CANVAS_W, CANVAS_H],
 			format: 'rgba8unorm',
@@ -843,12 +894,6 @@
 		colorPickStagingBuf = device.createBuffer({
 			size: 256,
 			usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-		});
-
-		// Image preview highlight uniform buffer (96 bytes)
-		imgPreviewUniformBuf = device.createBuffer({
-			size: 96,
-			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 		});
 
 		buildPipelines();
@@ -1036,60 +1081,56 @@
 		isDirty = false;
 
 		const hc = hoveredColor || { r: 0, g: 0, b: 0 };
-		cameraUniformData[0] = yaw;
-		cameraUniformData[1] = pitch;
-		cameraUniformData[2] = radius;
-		cameraUniformData[3] = CANVAS_W / CANVAS_H;
-		cameraUniformData[4] = weightMin;
-		cameraUniformData[5] = weightMax;
-		cameraUniformData[6] = hoveredColor ? 1.0 : 0.0;
-		cameraUniformData[7] = colorThreshold;
-		cameraUniformData[8] = hc.r;
-		cameraUniformData[9] = hc.g;
-		cameraUniformData[10] = hc.b;
-		cameraUniformData[11] = colorSpace === 'oklab' ? 1.0 : 0.0;
-		cameraUniformData[12] = lutSize;
-		cameraUniformData[13] = renderSteps;
 
-		device.queue.writeBuffer(cameraBuffer, 0, cameraUniformData);
+		// TypeGPU typed write — field names match the CameraStruct schema,
+		// eliminating error-prone float array index arithmetic.
+		cameraUniform.write({
+			yaw,
+			pitch,
+			radius,
+			aspect: CANVAS_W / CANVAS_H,
+			weightMin,
+			weightMax,
+			hoverEnabled: hoveredColor ? 1.0 : 0.0,
+			hoverThreshold: colorThreshold,
+			hoveredColor: { x: hc.r, y: hc.g, z: hc.b },
+			colorSpace: colorSpace === 'oklab' ? 1.0 : 0.0,
+			lutSize,
+			steps: renderSteps,
+			_pad1: 0,
+			_pad2: 0
+		});
 
-		// Update image-preview highlight uniforms
-		if (imgPreviewUniformBuf && imageLoaded) {
-			if (hoveredColor) {
-				imgPreviewF32[0] = hoveredColor.r;
-				imgPreviewF32[1] = hoveredColor.g;
-				imgPreviewF32[2] = hoveredColor.b;
-				imgPreviewF32[3] = colorThreshold;
-				imgPreviewU32[4] = 1;
-			} else {
-				imgPreviewF32[3] = colorThreshold;
-				imgPreviewU32[4] = 0;
-			}
-			imgPreviewU32[5] = colorSpace === 'oklab' ? 1 : 0;
-			let effectiveFlatten = enableFlattening ? flattenWeight : 1.0;
-			imgPreviewF32[6] = effectiveFlatten;
-			imgPreviewF32[7] = contrast;
+		// Update image-preview highlight uniforms via typed write
+		if (hlUniform && imageLoaded) {
+			const effectiveFlatten = enableFlattening ? flattenWeight : 1.0;
+			const center = colorSpace === 'oklab' ? cloudCenterOKLab : cloudCenterRGB;
+			const nx = -Math.sin(yaw) * Math.cos(pitch);
+			const ny = -Math.sin(pitch);
+			const nz = Math.cos(yaw) * Math.cos(pitch);
 
-			let center = colorSpace === 'oklab' ? cloudCenterOKLab : cloudCenterRGB;
-			imgPreviewF32[8] = center[0];
-			imgPreviewF32[9] = center[1];
-			imgPreviewF32[10] = center[2];
-			imgPreviewF32[11] = saturation;
-
-			let nx = -Math.sin(yaw) * Math.cos(pitch);
-			let ny = -Math.sin(pitch);
-			let nz = Math.cos(yaw) * Math.cos(pitch);
-			imgPreviewF32[12] = nx;
-			imgPreviewF32[13] = ny;
-			imgPreviewF32[14] = nz;
-			imgPreviewF32[15] = cloudCenterOKLab[1]; // avgL
-			imgPreviewF32[16] = rotation;
-			imgPreviewF32[17] = targetHue;
-			imgPreviewF32[18] = enableHuePull ? hueWeight : 0.0;
-			imgPreviewF32[19] = targetChroma;
-			imgPreviewF32[20] = enableChromaPull ? chromaWeight : 0.0;
-
-			device.queue.writeBuffer(imgPreviewUniformBuf, 0, imgPreviewUniformData);
+			// TypeGPU typed write — matches HighlightStruct schema exactly.
+			// vec3f fields accept { x, y, z } objects.
+			hlUniform.write({
+				hoveredColor: { x: hc.r, y: hc.g, z: hc.b },
+				threshold: colorThreshold,
+				enabled: hoveredColor ? 1 : 0,
+				colorSpace: colorSpace === 'oklab' ? 1 : 0,
+				flattenWeight: effectiveFlatten,
+				contrast,
+				cloudCenter: { x: center[0], y: center[1], z: center[2] },
+				saturation,
+				cameraNormal: { x: nx, y: ny, z: nz },
+				avgL: cloudCenterOKLab[1],
+				rotation,
+				targetHue,
+				hueWeight: enableHuePull ? hueWeight : 0.0,
+				targetChroma,
+				chromaWeight: enableChromaPull ? chromaWeight : 0.0,
+				_pad3: 0,
+				_pad4: 0,
+				_pad5: 0
+			});
 		}
 
 		const enc = device.createCommandEncoder();
@@ -1310,7 +1351,9 @@
 			entries: [
 				{ binding: 0, resource: imgTexture.createView() },
 				{ binding: 1, resource: sampler },
-				{ binding: 2, resource: { buffer: imgPreviewUniformBuf } }
+				// .buffer extracts the TgpuBuffer from the TgpuUniform shorthand;
+				// root.unwrap() then converts it to the raw GPUBuffer.
+				{ binding: 2, resource: { buffer: root.unwrap(hlUniform.buffer) } }
 			]
 		});
 	}
