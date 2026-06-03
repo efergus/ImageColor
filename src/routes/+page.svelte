@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	// TODO notes:
 	// When hovering the image, I want to show a cloud of only colors in the hover zone
 
@@ -102,8 +102,8 @@
 	let targetChroma = $state(0.1);
 	let chromaWeight = $state(0.0);
 
-	let lastBuiltYaw: number | null = null,
-		lastBuiltPitch: number | null = null,
+	let lastBuiltYaw = null,
+		lastBuiltPitch = null,
 		lastBuiltFlatten = 1.0,
 		lastBuiltEnableFlattening = true;
 	let lastBuiltContrast = 1.0,
