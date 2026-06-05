@@ -44,6 +44,7 @@
 		"vitest-browser-svelte": "^2.1.0"
 	},
 	"dependencies": {
+		"@typegpu/noise": "^0.11.0",
 		"typegpu": "^0.11.4"
 	}
 }
