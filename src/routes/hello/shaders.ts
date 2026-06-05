@@ -161,9 +161,12 @@ export const triangleFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof triangle
 		const currentPoint = std.add(start, std.mul(direction, std.mul(stepSize, d.f32(i))));
 		const sample = textureSampleLevel(cameraBindLayout.$.weightTexture, cameraBindLayout.$.weightSampler, currentPoint, 0);
 
-		const remapped = std.min(sample.w / wRange, 1.0);
-		const expTerm = std.exp(std.mul(-remapped * 100.0, stepSize));
-		const alpha = std.max(std.sub(d.f32(1.0), expTerm), 0.0);
+		if (sample.w > 4.0) {
+			continue;
+		}
+		const remapped = sample.w / wRange;
+		const expTerm = std.exp(std.mul(-remapped, stepSize));
+		const alpha = std.sub(d.f32(1.0), expTerm);
 
 		// const sampleColor = d.vec3f(texCoords.x, texCoords.y, texCoords.z);
 		// const sampleColor = linear_rgb_to_srgb(oklab_to_linear_rgb(d.vec3f(texCoords.y, (texCoords.x - 0.5), (texCoords.z - 0.5))));
