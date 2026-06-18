@@ -266,7 +266,7 @@ export const imageFragment = ({ uv }: { uv: d.v2f }) => {
 export const triangleFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof triangleFragmentOutput> => {
 	'use gpu';
 
-	const bg = d.vec4f(1.0, 1.0, 1.0, 1.0);
+	const bg = d.vec4f(0.1, 0.1, 0.1, 1.0);
 
 	const center = d.vec3f(0.5, 0.5, 0.5);
 	const ray = cameraRay(

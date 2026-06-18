@@ -1,5 +1,14 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { Select, Slider } from 'bits-ui';
+	import {
+		DropHalfIcon,
+		CircleHalfIcon,
+		CaretUpDownIcon,
+		CaretDoubleUpIcon,
+		CaretDoubleDownIcon,
+		CheckIcon
+	} from 'phosphor-svelte';
 	import tgpu, {
 		type RenderFlag,
 		type SampledFlag,
@@ -21,6 +30,13 @@
 		{ name: 'Bee', src: beeCloseImg },
 		{ name: 'Flower', src: flowerImg },
 		{ name: 'Pastels', src: pastelsImg }
+	];
+
+	const tableSizes = [
+		{ value: '16', label: '16' },
+		{ value: '32', label: '32' },
+		{ value: '64', label: '64' },
+		{ value: '128', label: '128' }
 	];
 
 	import {
@@ -51,14 +67,17 @@
 	let imageCanvas: HTMLCanvasElement;
 	let animationFrameId: number;
 	let updated = $state(0.0);
+	let filterUpdated = $state(0.0);
+	let filterCalculated = $state(0.0);
 	let yaw = $state(0.0);
 	let pitch = $state(0.2);
 	let radius = $state(2);
-	let steps = $state(42);
+	let steps = $state(24);
 	let sensitivity = $state(5.0);
 	let saturation = $state(1.0);
 	let contrast = $state(1.0);
 	let tableSize = $state(64);
+	let tableSizeStr = $state('64');
 	let color = $state('rgba(0, 0, 0, 1)');
 	let isHovering = $state(false);
 	let imageName = $state('Bee');
@@ -86,8 +105,18 @@
 	} | null = null;
 
 	let isReadingBack = false;
-	let pickTextureCache: { data: Uint8Array; width: number; height: number; bytesPerRow: number } | null = null;
-	let filteredTextureCache: { data: Uint8Array; width: number; height: number; bytesPerRow: number } | null = null;
+	let pickTextureCache: {
+		data: Uint8Array;
+		width: number;
+		height: number;
+		bytesPerRow: number;
+	} | null = null;
+	let filteredTextureCache: {
+		data: Uint8Array;
+		width: number;
+		height: number;
+		bytesPerRow: number;
+	} | null = null;
 
 	const invalidateCaches = () => {
 		pickTextureCache = null;
@@ -110,11 +139,10 @@
 		});
 
 		const enc = root.device.createCommandEncoder();
-		enc.copyTextureToBuffer(
-			{ texture: rawTexture },
-			{ buffer: stagingBuffer, bytesPerRow },
-			[width, height]
-		);
+		enc.copyTextureToBuffer({ texture: rawTexture }, { buffer: stagingBuffer, bytesPerRow }, [
+			width,
+			height
+		]);
 		root.device.queue.submit([enc.finish()]);
 
 		const startTime = performance.now();
@@ -131,7 +159,8 @@
 	async function readColorAtPixel(texture: TgpuTexture, px: number, py: number) {
 		if (isReadingBack || !gpuState || !colorCanvas) return;
 
-		let cache: { data: Uint8Array; width: number; height: number; bytesPerRow: number } | null = null;
+		let cache: { data: Uint8Array; width: number; height: number; bytesPerRow: number } | null =
+			null;
 
 		if (texture === gpuState.pickTexture) {
 			if (!pickTextureCache) {
@@ -350,6 +379,8 @@
 		if (!encoder) {
 			root.device.queue.submit([_encoder.finish()]);
 		}
+
+		filterCalculated = filterUpdated;
 	};
 
 	const renderScene = async (encoder?: GPUCommandEncoder) => {
@@ -357,10 +388,14 @@
 			console.log('gpuState is null');
 			return;
 		}
-		requestAnimationFrame(() => renderScene());
+
+		if (filterUpdated > filterCalculated) {
+			computeWeightTexture(tableSize);
+		}
 
 		const now = Date.now();
 		if (now - updated > 100) {
+			requestAnimationFrame(() => renderScene());
 			return;
 		}
 
@@ -438,6 +473,7 @@
 		} else {
 			console.warn('querySet not available');
 		}
+		requestAnimationFrame(() => renderScene());
 	};
 
 	onMount(async () => {
@@ -596,7 +632,15 @@
 		updated = Date.now();
 	};
 
-	const onTableSizeChange = () => {
+	const onFilterUpdate = () => {
+		const now = Date.now();
+		filterUpdated = now;
+		updated = now;
+	};
+
+	const onTableSizeChange = (v: string) => {
+		tableSizeStr = v;
+		tableSize = parseInt(v);
 		if (gpuState) {
 			const encoder = gpuState.root.device.createCommandEncoder();
 
@@ -788,46 +832,127 @@
 			{/if}
 		</div>
 
-		<input type="range" min="0" max="10" step="0.01" bind:value={sensitivity} oninput={() => { onUpdate(); invalidateCaches(); }} />
 		<input
 			type="range"
 			min="0"
-			max="2"
+			max="10"
 			step="0.01"
-			bind:value={saturation}
+			bind:value={sensitivity}
 			oninput={() => {
 				onUpdate();
 				invalidateCaches();
-				computeWeightTexture(tableSize);
 			}}
 		/>
-		<input
-			type="range"
-			min="0"
-			max="2"
-			step="0.01"
-			bind:value={contrast}
-			oninput={() => {
-				onUpdate();
-				invalidateCaches();
-				computeWeightTexture(tableSize);
-			}}
-		/>
-
-		<div class="radio-group">
-			<span>Table Size:</span>
-			{#each [16, 32, 64, 128] as size}
-				<label>
-					<input
-						type="radio"
-						name="tableSize"
-						value={size}
-						bind:group={tableSize}
-						onchange={onTableSizeChange}
+		<div class="mb-4 flex w-[280px] w-full flex-col gap-1">
+			<div class="pl-8 text-sm text-slate-400">
+				<span>Saturation</span>
+			</div>
+			<div class="flex items-center gap-2">
+				<DropHalfIcon size={24} class="text-slate-400" />
+				<Slider.Root
+					type="single"
+					value={saturation}
+					max={2}
+					step={0.01}
+					class="relative flex w-full touch-none items-center select-none"
+					onValueChange={(v) => {
+						saturation = v;
+						onFilterUpdate();
+						invalidateCaches();
+					}}
+				>
+					<span
+						class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20"
+					>
+						<Slider.Range class="absolute h-full bg-blue-600" />
+					</span>
+					<Slider.Thumb
+						index={0}
+						class="block size-[20px] cursor-pointer rounded-full border-2 border-blue-600 bg-white shadow-sm transition-colors hover:border-white/30 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50 data-active:scale-[0.98] data-active:border-white/30"
 					/>
-					{size}
-				</label>
-			{/each}
+				</Slider.Root>
+			</div>
+		</div>
+
+		<div class="mb-4 flex w-[280px] w-full flex-col gap-1">
+			<div class="pl-8 text-sm text-slate-400">
+				<span>Contrast</span>
+			</div>
+			<div class="flex items-center gap-2">
+				<CircleHalfIcon size={24} class="text-slate-400" />
+				<Slider.Root
+					type="single"
+					value={contrast}
+					max={2}
+					step={0.01}
+					class="relative flex w-full touch-none items-center select-none"
+					onValueChange={(v) => {
+						contrast = v;
+						onFilterUpdate();
+						invalidateCaches();
+					}}
+				>
+					<span
+						class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20"
+					>
+						<Slider.Range class="absolute h-full bg-blue-600" />
+					</span>
+					<Slider.Thumb
+						index={0}
+						class="block size-[20px] cursor-pointer rounded-full border-2 border-blue-600 bg-white shadow-sm transition-colors hover:border-white/30 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50 data-active:scale-[0.98] data-active:border-white/30"
+					/>
+				</Slider.Root>
+			</div>
+		</div>
+
+		<div class="mt-4 flex items-center gap-2">
+			<span class="text-slate-200">Table Size:</span>
+			<Select.Root
+				type="single"
+				value={tableSizeStr}
+				onValueChange={onTableSizeChange}
+				items={tableSizes}
+				allowDeselect={false}
+			>
+				<Select.Trigger
+					class="inline-flex h-10 w-[200px] touch-none items-center rounded-md border border-white/10 bg-slate-800 px-3 text-sm transition-colors select-none"
+					aria-label="Select a table size"
+				>
+					<Select.Value placeholder="Select a table size" />
+					<CaretUpDownIcon class="ml-auto size-5 text-slate-400" />
+				</Select.Trigger>
+				<Select.Portal>
+					<Select.Content
+						class="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-[state=closed]:animate-out data-[state=open]:animate-in z-50 h-auto max-h-96 w-[var(--bits-select-anchor-width)] min-w-[var(--bits-select-anchor-width)] rounded-xl border border-slate-700 bg-slate-800 px-1 py-1 shadow-md outline-hidden select-none"
+						sideOffset={10}
+					>
+						<Select.ScrollUpButton class="flex w-full items-center justify-center">
+							<CaretDoubleUpIcon class="size-3 text-slate-400" />
+						</Select.ScrollUpButton>
+						<Select.Viewport class="p-1">
+							{#each tableSizes as size, i (i + size.value)}
+								<Select.Item
+									class="flex h-9 w-full cursor-pointer items-center rounded-md py-2 pr-1.5 pl-3 text-sm text-white outline-hidden select-none data-highlighted:bg-blue-600"
+									value={size.value}
+									label={size.label}
+								>
+									{#snippet children({ selected })}
+										{size.label}
+										{#if selected}
+											<div class="ml-auto">
+												<CheckIcon aria-label="check" class="size-4" />
+											</div>
+										{/if}
+									{/snippet}
+								</Select.Item>
+							{/each}
+						</Select.Viewport>
+						<Select.ScrollDownButton class="flex w-full items-center justify-center">
+							<CaretDoubleDownIcon class="size-3 text-slate-400" />
+						</Select.ScrollDownButton>
+					</Select.Content>
+				</Select.Portal>
+			</Select.Root>
 		</div>
 	</main>
 </div>
