@@ -7,7 +7,9 @@
 		CaretUpDownIcon,
 		CaretDoubleUpIcon,
 		CaretDoubleDownIcon,
-		CheckIcon
+		CheckIcon,
+		GaugeIcon,
+		SquareHalfIcon
 	} from 'phosphor-svelte';
 	import tgpu, {
 		type RenderFlag,
@@ -44,7 +46,7 @@
 		triangleFragment,
 		cameraBindLayout,
 		cameraUniform,
-		calculateWeights,
+		weightCalculation,
 		computeOptions,
 		weightCalculationLayout,
 		processWeights,
@@ -61,7 +63,13 @@
 		textureRenderLayout
 	} from './shaders';
 	import { once } from './gpu_utils';
-	import { select } from 'typegpu/std';
+	import { select, textureDimensions } from 'typegpu/std';
+	import {
+		calculateWeights,
+		filterTexture,
+		processWeightTexture,
+		blurWeightTexture
+	} from './orchestration';
 
 	let colorCanvas: HTMLCanvasElement;
 	let imageCanvas: HTMLCanvasElement;
@@ -73,7 +81,9 @@
 	let pitch = $state(0.2);
 	let radius = $state(2);
 	let steps = $state(24);
-	let sensitivity = $state(5.0);
+	let sensitivitySlider = $state(3.0);
+	let sensitivity = $derived(sensitivitySlider === 0 ? 0 : Math.pow(10, sensitivitySlider - 2));
+	let bgColor = $state(0.2);
 	let saturation = $state(1.0);
 	let contrast = $state(1.0);
 	let tableSize = $state(64);
@@ -85,11 +95,8 @@
 
 	let gpuState: {
 		root: TgpuRoot;
-		weightCalculationPipeline: TgpuGuardedComputePipeline;
-		weightProcessingPipeline: TgpuGuardedComputePipeline;
-		blurPipeline: TgpuGuardedComputePipeline;
-		renderPipeline: TgpuRenderPipeline;
-		imageRenderPipeline: TgpuRenderPipeline;
+		renderPipeline: any;
+		imageRenderPipeline: any;
 		context: GPUCanvasContext;
 		imageContext: GPUCanvasContext;
 		optionsBuffer: TgpuBuffer<typeof computeOptions> & UniformFlag;
@@ -102,6 +109,7 @@
 		pickStagingBuffer: TgpuBuffer<d.WgslArray<d.U32>>;
 		linearSampler: GPUSampler;
 		querySet: TgpuQuerySet<'timestamp'>;
+		blurredWeightTexture: any;
 	} | null = null;
 
 	let isReadingBack = false;
@@ -130,7 +138,9 @@
 		const width = rawTexture.width;
 		const height = rawTexture.height;
 
-		const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
+		const isFloat16 = rawTexture.format === 'rgba16float';
+		const bytesPerPixel = isFloat16 ? 8 : 4;
+		const bytesPerRow = Math.ceil((width * bytesPerPixel) / 256) * 256;
 		const bufferSize = bytesPerRow * height;
 
 		const stagingBuffer = root.device.createBuffer({
@@ -189,7 +199,34 @@
 		px = Math.max(0, Math.min(cache.width - 1, Math.floor(px)));
 		py = Math.max(0, Math.min(cache.height - 1, Math.floor(py)));
 
-		const offset = py * cache.bytesPerRow + px * 4;
+		const isFloat16 = texture === gpuState.filteredTexture;
+		const bytesPerPixel = isFloat16 ? 8 : 4;
+		const offset = py * cache.bytesPerRow + px * bytesPerPixel;
+
+		if (isFloat16) {
+			const view = new DataView(cache.data.buffer, cache.data.byteOffset + offset, 8);
+			// Very basic float16 decode (fallback if getFloat16 is missing in TS)
+			const decodeF16 = (val: number) => {
+				const exp = (val & 0x7c00) >> 10;
+				const frac = val & 0x03ff;
+				return (
+					(val & 0x8000 ? -1 : 1) *
+					(exp === 0
+						? Math.pow(2, -14) * (frac / 1024)
+						: exp === 0x1f
+							? frac
+								? NaN
+								: Infinity
+							: Math.pow(2, exp - 15) * (1 + frac / 1024))
+				);
+			};
+			const r = decodeF16(view.getUint16(0, true)) * 255;
+			const g = decodeF16(view.getUint16(2, true)) * 255;
+			const b = decodeF16(view.getUint16(4, true)) * 255;
+			const a = decodeF16(view.getUint16(6, true)) * 255;
+			return d.vec4i(r, g, b, a);
+		}
+
 		const r = cache.data[offset];
 		const g = cache.data[offset + 1];
 		const b = cache.data[offset + 2];
@@ -197,29 +234,6 @@
 
 		return d.vec4i(r, g, b, a);
 	}
-
-	let weightBuffers: Map<number, TgpuBuffer<d.WgslArray<d.U32>> & StorageFlag> = new Map();
-	let weightTextures: Map<
-		number,
-		TgpuTexture<
-			{
-				size: [number, number, number];
-				format: 'rgba16float';
-				dimension: '3d';
-			} & StorageFlag
-		>
-	> = new Map();
-
-	let blurredWeightTextures: Map<
-		number,
-		TgpuTexture<
-			{
-				size: [number, number, number];
-				format: 'rgba16float';
-				dimension: '3d';
-			} & StorageFlag
-		>
-	> = new Map();
 
 	const imageUrlToBitmap = async (url: string) => {
 		const img = new Image();
@@ -272,47 +286,6 @@
 		return texture;
 	};
 
-	const getWeightBuffer = (root: TgpuRoot, tableSize: number) => {
-		if (weightBuffers.has(tableSize)) {
-			return weightBuffers.get(tableSize)!;
-		}
-		const buffer = root
-			.createBuffer(d.arrayOf(d.u32, tableSize * tableSize * tableSize * 4))
-			.$usage('storage');
-		weightBuffers.set(tableSize, buffer);
-		return buffer;
-	};
-
-	const getWeightTexture = (root: TgpuRoot, tableSize: number) => {
-		if (weightTextures.has(tableSize)) {
-			return weightTextures.get(tableSize)!;
-		}
-		const texture = root
-			.createTexture({
-				size: [tableSize, tableSize, tableSize],
-				format: 'rgba16float',
-				dimension: '3d'
-			})
-			.$usage('render', 'sampled', 'storage');
-		weightTextures.set(tableSize, texture);
-		return texture;
-	};
-
-	const getBlurredWeightTexture = (root: TgpuRoot, tableSize: number) => {
-		if (blurredWeightTextures.has(tableSize)) {
-			return blurredWeightTextures.get(tableSize)!;
-		}
-		const texture = root
-			.createTexture({
-				size: [tableSize, tableSize, tableSize],
-				format: 'rgba16float',
-				dimension: '3d'
-			})
-			.$usage('render', 'sampled', 'storage');
-		blurredWeightTextures.set(tableSize, texture);
-		return texture;
-	};
-
 	const computeWeightTexture = (tableSize: number, encoder?: GPUCommandEncoder) => {
 		if (!gpuState) {
 			console.log('gpuState is null');
@@ -322,9 +295,6 @@
 		const {
 			root,
 			renderPipeline,
-			weightCalculationPipeline,
-			weightProcessingPipeline,
-			blurPipeline,
 			optionsBuffer,
 			imageBitmap,
 			imageTexture,
@@ -337,44 +307,32 @@
 
 		applyFilters();
 
-		const weightsBuffer = getWeightBuffer(root, tableSize);
-		const weightTexture = getWeightTexture(root, tableSize);
-		const blurredWeightTexture = getBlurredWeightTexture(root, tableSize);
+		const textureSize = d.vec2u(imageBitmap.width, imageBitmap.height);
 
-		_encoder.clearBuffer(weightsBuffer.buffer, 0);
-
-		const computeBindGroup = root.createBindGroup(weightCalculationLayout, {
-			options: optionsBuffer,
-			image: filteredTexture,
-			weights: weightsBuffer
+		// _encoder.clearBuffer(weightsBuffer.buffer, 0);
+		const weightsBuffer = calculateWeights(root, gpuState.filteredTexture, {
+			tableSize: tableSize,
+			textureSize: textureSize
 		});
 
-		weightCalculationPipeline
-			.with(computeBindGroup)
-			.with(_encoder)
-			.dispatchThreads(imageBitmap.width, imageBitmap.height);
-
-		const weightProcessingBindGroup = root.createBindGroup(weightTransferLayout, {
-			options: optionsBuffer,
-			weights: weightsBuffer,
-			outputTexture: weightTexture
+		const weightTexture = processWeightTexture(root, weightsBuffer, {
+			tableSize: tableSize,
+			textureSize: textureSize
 		});
 
-		weightProcessingPipeline
-			.with(weightProcessingBindGroup)
-			.with(_encoder)
-			.dispatchThreads(tableSize, tableSize, tableSize);
-
-		const blurBindGroup = root.createBindGroup(weightProcessingLayout, {
-			options: gpuState.filterOptionsBuffer,
-			inputTexture: weightTexture.createView('sampled'),
-			outputTexture: blurredWeightTexture
-		});
-
-		blurPipeline
-			.with(blurBindGroup)
-			.with(_encoder)
-			.dispatchThreads(tableSize, tableSize, tableSize);
+		gpuState.blurredWeightTexture = blurWeightTexture(
+			root,
+			weightTexture,
+			{
+				textureSize: textureSize,
+				selectedColor: isHovering
+					? d.vec4f(hoveredRGB.x, hoveredRGB.y, hoveredRGB.z, 0.05)
+					: d.vec4f(0.0, 0.0, 0.0, 1000.0),
+				saturation: saturation,
+				contrast: contrast
+			},
+			tableSize
+		);
 
 		if (!encoder) {
 			root.device.queue.submit([_encoder.finish()]);
@@ -409,13 +367,14 @@
 			context,
 			imageContext,
 			filteredTexture,
-			querySet
+			querySet,
+			imageBitmap
 		} = gpuState;
 		const _encoder = encoder ?? root.device.createCommandEncoder();
-		const blurredWeightTexture = getBlurredWeightTexture(root, tableSize);
-		const weightTexture = getWeightTexture(root, tableSize);
+		const blurredWeightTexture = gpuState.blurredWeightTexture;
 
 		gpuState.filterOptionsBuffer.write({
+			textureSize: d.vec2u(imageBitmap.width, imageBitmap.height),
 			selectedColor: isHovering
 				? d.vec4f(hoveredRGB.x, hoveredRGB.y, hoveredRGB.z, 0.05)
 				: d.vec4f(0.0, 0.0, 0.0, 1000.0),
@@ -429,11 +388,12 @@
 			radius,
 			aspect: colorCanvas.width / colorCanvas.height,
 			steps,
-			sensitivity
+			sensitivity,
+			bgColor
 		});
 
 		const textureBindGroup = root.createBindGroup(textureRenderLayout, {
-			texture: filteredTexture.createView('render'),
+			texture: filteredTexture,
 			sampler: linearSampler,
 			options: gpuState.filterOptionsBuffer
 		});
@@ -441,7 +401,7 @@
 		const bindGroup = root.createBindGroup(cameraBindLayout, {
 			cameraUniform: cameraUniformBuffer,
 			options: gpuState.filterOptionsBuffer,
-			weightTexture: blurredWeightTexture.createView('render'),
+			weightTexture: blurredWeightTexture as any,
 			weightSampler: linearSampler
 		});
 
@@ -450,11 +410,14 @@
 			.with(_encoder)
 			.withColorAttachment({
 				color: { view: context },
-				pick: { view: pickTexture.createView('render') }
+				pick: { view: (pickTexture as any).createView('render') }
 			})
 			.draw(6);
 
-		imageRenderPipeline.with(textureBindGroup).withColorAttachment({ view: imageContext }).draw(6);
+		imageRenderPipeline
+			.with(textureBindGroup)
+			.withColorAttachment({ view: imageContext } as any)
+			.draw(6);
 
 		if (!encoder) {
 			root.device.queue.submit([_encoder.finish()]);
@@ -519,28 +482,6 @@
 
 			const querySet = root.createQuerySet('timestamp', 16);
 
-			const weightCalculationPipeline = root
-				.createGuardedComputePipeline(calculateWeights)
-				.withTimestampWrites({
-					querySet,
-					beginningOfPassWriteIndex: 0,
-					endOfPassWriteIndex: 1
-				});
-
-			const weightProcessingPipeline = root
-				.createGuardedComputePipeline(processWeights)
-				.withTimestampWrites({
-					querySet,
-					beginningOfPassWriteIndex: 2,
-					endOfPassWriteIndex: 3
-				});
-
-			const blurPipeline = root.createGuardedComputePipeline(blur).withTimestampWrites({
-				querySet,
-				beginningOfPassWriteIndex: 4,
-				endOfPassWriteIndex: 5
-			});
-
 			const renderPipeline = root
 				.createRenderPipeline({
 					primitive: { topology: 'triangle-list' },
@@ -570,10 +511,11 @@
 				});
 
 			const optionsBuffer = root.createBuffer(computeOptions).$usage('uniform');
-			optionsBuffer.write({ tableSize });
+			optionsBuffer.write({ textureSize: d.vec2u(bitmap.width, bitmap.height), tableSize });
 
 			const filterOptionsBuffer = root.createBuffer(filterOptions).$usage('uniform');
 			filterOptionsBuffer.write({
+				textureSize: d.vec2u(bitmap.width, bitmap.height),
 				selectedColor: d.vec4f(0.0, 0.0, 0.0, 1000.0),
 				saturation: saturation,
 				contrast: contrast
@@ -586,14 +528,12 @@
 				radius: 2,
 				aspect: colorCanvas.width / colorCanvas.height,
 				steps,
-				sensitivity
+				sensitivity,
+				bgColor
 			});
 
 			gpuState = {
 				root,
-				weightCalculationPipeline,
-				weightProcessingPipeline,
-				blurPipeline,
 				renderPipeline,
 				imageRenderPipeline,
 				optionsBuffer,
@@ -607,7 +547,8 @@
 				pickStagingBuffer,
 				linearSampler: sampler,
 				filteredTexture: texture,
-				querySet
+				querySet,
+				blurredWeightTexture: null
 			};
 
 			const encoder = root.device.createCommandEncoder();
@@ -644,7 +585,10 @@
 		if (gpuState) {
 			const encoder = gpuState.root.device.createCommandEncoder();
 
-			gpuState.optionsBuffer.write({ tableSize });
+			gpuState.optionsBuffer.write({
+				tableSize,
+				textureSize: d.vec2u(gpuState.imageBitmap.width, gpuState.imageBitmap.height)
+			});
 			invalidateCaches();
 			computeWeightTexture(tableSize, encoder);
 			updated = Date.now();
@@ -659,30 +603,23 @@
 		const height = gpuState.imageBitmap.height;
 		const imageTexture = gpuState.imageTexture;
 
-		const { textures, pipeline, sampler } = once(`filters-${width}-${height}`, () => {
+		const { textures, outputViews, sampler } = once([applyFilters, width, height], () => {
 			const textures = [
 				root
 					.createTexture({
 						size: [width, height],
-						format: 'rgba8unorm'
+						format: 'rgba16float'
 					})
 					.$usage('render', 'sampled', 'storage'),
 				root
 					.createTexture({
 						size: [width, height],
-						format: 'rgba8unorm'
+						format: 'rgba16float'
 					})
 					.$usage('render', 'sampled', 'storage')
 			];
 
-			const pipeline = root.with(filterSlot, saturationFilter).createRenderPipeline({
-				primitive: { topology: 'triangle-list' },
-				vertex: quadVertex,
-				fragment: filterFragment,
-				targets: {
-					color: { format: 'rgba8unorm' }
-				}
-			});
+			const outputViews = [textures[0].createView('render'), textures[1].createView('render')];
 
 			const sampler = root.createSampler({
 				magFilter: 'linear',
@@ -691,24 +628,20 @@
 
 			return {
 				textures,
-				pipeline,
+				outputViews,
 				sampler
 			};
 		});
 
-		const bindGroup = root.createBindGroup(filterBindLayout, {
-			texture: imageTexture,
-			sampler: sampler,
-			filterOptions: gpuState.filterOptionsBuffer
+		const outputTexture = filterTexture(root, imageTexture, sampler, {
+			textureSize: d.vec2u(width, height),
+			selectedColor: d.vec4f(0.0, 0.0, 0.0, 1000.0),
+			saturation: saturation,
+			contrast: contrast
 		});
 
-		pipeline
-			.with(bindGroup)
-			.withColorAttachment({ color: { view: textures[1].createView('render') } })
-			.draw(6);
-
-		gpuState.filteredTexture = textures[1];
-		return textures[1];
+		gpuState.filteredTexture = outputTexture;
+		return outputTexture;
 	};
 	// const calculateWeights = () => {};
 	// const renderScene = () => {};
@@ -832,127 +765,194 @@
 			{/if}
 		</div>
 
-		<input
-			type="range"
-			min="0"
-			max="10"
-			step="0.01"
-			bind:value={sensitivity}
-			oninput={() => {
-				onUpdate();
-				invalidateCaches();
-			}}
-		/>
-		<div class="mb-4 flex w-[280px] w-full flex-col gap-1">
-			<div class="pl-8 text-sm text-slate-400">
-				<span>Saturation</span>
-			</div>
-			<div class="flex items-center gap-2">
-				<DropHalfIcon size={24} class="text-slate-400" />
-				<Slider.Root
-					type="single"
-					value={saturation}
-					max={2}
-					step={0.01}
-					class="relative flex w-full touch-none items-center select-none"
-					onValueChange={(v) => {
-						saturation = v;
-						onFilterUpdate();
-						invalidateCaches();
-					}}
-				>
-					<span
-						class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20"
-					>
-						<Slider.Range class="absolute h-full bg-blue-600" />
-					</span>
-					<Slider.Thumb
-						index={0}
-						class="block size-[20px] cursor-pointer rounded-full border-2 border-blue-600 bg-white shadow-sm transition-colors hover:border-white/30 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50 data-active:scale-[0.98] data-active:border-white/30"
-					/>
-				</Slider.Root>
-			</div>
-		</div>
+		<div class="mt-4 grid w-full max-w-[1000px] grid-cols-2 gap-12 px-4">
+			<!-- Left Column: Color Cloud Settings -->
+			<div class="flex flex-col gap-6">
+				<h3 class="border-b border-white/10 pb-2 text-lg font-semibold text-slate-200">
+					Color Cloud Settings
+				</h3>
 
-		<div class="mb-4 flex w-[280px] w-full flex-col gap-1">
-			<div class="pl-8 text-sm text-slate-400">
-				<span>Contrast</span>
-			</div>
-			<div class="flex items-center gap-2">
-				<CircleHalfIcon size={24} class="text-slate-400" />
-				<Slider.Root
-					type="single"
-					value={contrast}
-					max={2}
-					step={0.01}
-					class="relative flex w-full touch-none items-center select-none"
-					onValueChange={(v) => {
-						contrast = v;
-						onFilterUpdate();
-						invalidateCaches();
-					}}
-				>
-					<span
-						class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20"
-					>
-						<Slider.Range class="absolute h-full bg-blue-600" />
-					</span>
-					<Slider.Thumb
-						index={0}
-						class="block size-[20px] cursor-pointer rounded-full border-2 border-blue-600 bg-white shadow-sm transition-colors hover:border-white/30 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50 data-active:scale-[0.98] data-active:border-white/30"
-					/>
-				</Slider.Root>
-			</div>
-		</div>
+				<div class="flex w-full flex-col gap-1">
+					<div class="pl-8 text-sm text-slate-400">
+						<span>Sensitivity</span>
+					</div>
+					<div class="flex items-center gap-2">
+						<GaugeIcon size={24} class="text-slate-400" />
+						<Slider.Root
+							type="single"
+							value={sensitivitySlider}
+							max={6}
+							step={0.01}
+							class="relative flex w-full touch-none items-center select-none"
+							onValueChange={(v) => {
+								sensitivitySlider = v;
+								onUpdate();
+								invalidateCaches();
+							}}
+						>
+							<span
+								class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20"
+							>
+								<Slider.Range class="absolute h-full bg-blue-600" />
+							</span>
+							<Slider.Thumb
+								index={0}
+								class="block size-[20px] cursor-pointer rounded-full border-2 border-blue-600 bg-white shadow-sm transition-colors hover:border-white/30 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50 data-active:scale-[0.98] data-active:border-white/30"
+							/>
+						</Slider.Root>
+					</div>
+				</div>
 
-		<div class="mt-4 flex items-center gap-2">
-			<span class="text-slate-200">Table Size:</span>
-			<Select.Root
-				type="single"
-				value={tableSizeStr}
-				onValueChange={onTableSizeChange}
-				items={tableSizes}
-				allowDeselect={false}
-			>
-				<Select.Trigger
-					class="inline-flex h-10 w-[200px] touch-none items-center rounded-md border border-white/10 bg-slate-800 px-3 text-sm transition-colors select-none"
-					aria-label="Select a table size"
-				>
-					<Select.Value placeholder="Select a table size" />
-					<CaretUpDownIcon class="ml-auto size-5 text-slate-400" />
-				</Select.Trigger>
-				<Select.Portal>
-					<Select.Content
-						class="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-[state=closed]:animate-out data-[state=open]:animate-in z-50 h-auto max-h-96 w-[var(--bits-select-anchor-width)] min-w-[var(--bits-select-anchor-width)] rounded-xl border border-slate-700 bg-slate-800 px-1 py-1 shadow-md outline-hidden select-none"
-						sideOffset={10}
+				<div class="flex w-full flex-col gap-1">
+					<div class="pl-8 text-sm text-slate-400">
+						<span>Background Color</span>
+					</div>
+					<div class="flex items-center gap-2">
+						<SquareHalfIcon size={24} class="text-slate-400" />
+						<Slider.Root
+							type="single"
+							value={bgColor}
+							max={1}
+							step={0.01}
+							class="relative flex w-full touch-none items-center select-none"
+							onValueChange={(v) => {
+								bgColor = v;
+								onUpdate();
+								invalidateCaches();
+							}}
+						>
+							<span
+								class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20"
+							>
+								<Slider.Range class="absolute h-full bg-blue-600" />
+							</span>
+							<Slider.Thumb
+								index={0}
+								class="block size-[20px] cursor-pointer rounded-full border-2 border-blue-600 bg-white shadow-sm transition-colors hover:border-white/30 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50 data-active:scale-[0.98] data-active:border-white/30"
+							/>
+						</Slider.Root>
+					</div>
+				</div>
+
+				<div class="flex items-center gap-2">
+					<span class="text-slate-200">Table Size:</span>
+					<Select.Root
+						type="single"
+						value={tableSizeStr}
+						onValueChange={onTableSizeChange}
+						items={tableSizes}
+						allowDeselect={false}
 					>
-						<Select.ScrollUpButton class="flex w-full items-center justify-center">
-							<CaretDoubleUpIcon class="size-3 text-slate-400" />
-						</Select.ScrollUpButton>
-						<Select.Viewport class="p-1">
-							{#each tableSizes as size, i (i + size.value)}
-								<Select.Item
-									class="flex h-9 w-full cursor-pointer items-center rounded-md py-2 pr-1.5 pl-3 text-sm text-white outline-hidden select-none data-highlighted:bg-blue-600"
-									value={size.value}
-									label={size.label}
-								>
-									{#snippet children({ selected })}
-										{size.label}
-										{#if selected}
-											<div class="ml-auto">
-												<CheckIcon aria-label="check" class="size-4" />
-											</div>
-										{/if}
-									{/snippet}
-								</Select.Item>
-							{/each}
-						</Select.Viewport>
-						<Select.ScrollDownButton class="flex w-full items-center justify-center">
-							<CaretDoubleDownIcon class="size-3 text-slate-400" />
-						</Select.ScrollDownButton>
-					</Select.Content>
-				</Select.Portal>
-			</Select.Root>
+						<Select.Trigger
+							class="inline-flex h-10 w-[200px] touch-none items-center rounded-md border border-white/10 bg-slate-800 px-3 text-sm transition-colors select-none"
+							aria-label="Select a table size"
+						>
+							<Select.Value placeholder="Select a table size" />
+							<CaretUpDownIcon class="ml-auto size-5 text-slate-400" />
+						</Select.Trigger>
+						<Select.Portal>
+							<Select.Content
+								class="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-[state=closed]:animate-out data-[state=open]:animate-in z-50 h-auto max-h-96 w-[var(--bits-select-anchor-width)] min-w-[var(--bits-select-anchor-width)] rounded-xl border border-slate-700 bg-slate-800 px-1 py-1 shadow-md outline-hidden select-none"
+								sideOffset={10}
+							>
+								<Select.ScrollUpButton class="flex w-full items-center justify-center">
+									<CaretDoubleUpIcon class="size-3 text-slate-400" />
+								</Select.ScrollUpButton>
+								<Select.Viewport class="p-1">
+									{#each tableSizes as size, i (i + size.value)}
+										<Select.Item
+											class="flex h-9 w-full cursor-pointer items-center rounded-md py-2 pr-1.5 pl-3 text-sm text-white outline-hidden select-none data-highlighted:bg-blue-600"
+											value={size.value}
+											label={size.label}
+										>
+											{#snippet children({ selected })}
+												{size.label}
+												{#if selected}
+													<div class="ml-auto">
+														<CheckIcon aria-label="check" class="size-4" />
+													</div>
+												{/if}
+											{/snippet}
+										</Select.Item>
+									{/each}
+								</Select.Viewport>
+								<Select.ScrollDownButton class="flex w-full items-center justify-center">
+									<CaretDoubleDownIcon class="size-3 text-slate-400" />
+								</Select.ScrollDownButton>
+							</Select.Content>
+						</Select.Portal>
+					</Select.Root>
+				</div>
+			</div>
+
+			<!-- Right Column: Image Filters -->
+			<div class="flex flex-col gap-6">
+				<h3 class="border-b border-white/10 pb-2 text-lg font-semibold text-slate-200">
+					Image Filter Settings
+				</h3>
+
+				<div class="flex w-full flex-col gap-1">
+					<div class="pl-8 text-sm text-slate-400">
+						<span>Saturation</span>
+					</div>
+					<div class="flex items-center gap-2">
+						<DropHalfIcon size={24} class="text-slate-400" />
+						<Slider.Root
+							type="single"
+							value={saturation}
+							max={2}
+							step={0.01}
+							class="relative flex w-full touch-none items-center select-none"
+							onValueChange={(v) => {
+								saturation = v;
+								onFilterUpdate();
+								invalidateCaches();
+							}}
+						>
+							<span
+								class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20"
+							>
+								<Slider.Range class="absolute h-full bg-blue-600" />
+							</span>
+							<Slider.Thumb
+								index={0}
+								class="block size-[20px] cursor-pointer rounded-full border-2 border-blue-600 bg-white shadow-sm transition-colors hover:border-white/30 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50 data-active:scale-[0.98] data-active:border-white/30"
+							/>
+						</Slider.Root>
+					</div>
+				</div>
+
+				<div class="flex w-full flex-col gap-1">
+					<div class="pl-8 text-sm text-slate-400">
+						<span>Contrast</span>
+					</div>
+					<div class="flex items-center gap-2">
+						<CircleHalfIcon size={24} class="text-slate-400" />
+						<Slider.Root
+							type="single"
+							value={contrast}
+							max={2}
+							step={0.01}
+							class="relative flex w-full touch-none items-center select-none"
+							onValueChange={(v) => {
+								contrast = v;
+								onFilterUpdate();
+								invalidateCaches();
+							}}
+						>
+							<span
+								class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20"
+							>
+								<Slider.Range class="absolute h-full bg-blue-600" />
+							</span>
+							<Slider.Thumb
+								index={0}
+								class="block size-[20px] cursor-pointer rounded-full border-2 border-blue-600 bg-white shadow-sm transition-colors hover:border-white/30 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50 data-active:scale-[0.98] data-active:border-white/30"
+							/>
+						</Slider.Root>
+					</div>
+				</div>
+			</div>
 		</div>
 	</main>
 </div>

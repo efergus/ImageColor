@@ -1,11 +1,53 @@
+import type { TgpuBindGroup, TgpuBindGroupLayout, TgpuRoot } from "typegpu";
 
-const gpuMap = new Map<string, any>();
+const globalOnceMap = new Map<(...args: any[]) => void, any>();
 
-export const once = <T>(key: string, fn: () => T): T => {
-    if (gpuMap.has(key)) {
-        return gpuMap.get(key)!;
+export const once = <T>(keys: any | any[], fn: () => T): T => {
+    if (!Array.isArray(keys)) {
+        keys = [keys];
     }
-    const value = fn();
-    gpuMap.set(key, value);
-    return value;
+    return once2(globalOnceMap, keys, fn);
+}
+type OnceLeaf<V> = {
+    child: OnceMap<V>;
+    value: V | null
+}
+
+
+type OnceMap<V = any> = Map<any, OnceLeaf<V>>;
+
+const once2 = <V>(context: OnceMap<V>, keys: any[], fn: () => V): V => {
+    let result: OnceLeaf<V> = {
+        child: context,
+        value: null
+    };
+    for (const key of keys) {
+        let next = result.child.get(key);
+        if (next === undefined) {
+            next = {
+                child: new Map(),
+                value: null
+            }
+            result.child.set(key, next);
+        }
+        result = next;
+    }
+    if (result.value === null) {
+        result.value = fn();
+    }
+    return result.value;
+}
+
+const bindGroupMap: OnceMap<TgpuBindGroup<any>> = new Map();
+
+export const onceBindGroup = <T extends Record<string, any> = any>(root: TgpuRoot, bindGroupLayout: TgpuBindGroupLayout, entries: T) => {
+    const entryKeys = Object.keys(entries);
+    entryKeys.sort();
+    const key = [bindGroupLayout, ...entryKeys.map((key) => entries[key])];
+    return once2<TgpuBindGroup<any>>(bindGroupMap, key, () => {
+        return root.createBindGroup(
+            bindGroupLayout,
+            entries
+        )
+    });
 }

@@ -86,7 +86,7 @@ export const cameraRay = (uv: d.v2f, yaw: number, pitch: number, radius: number,
 	return RayStruct({ start: eye, direction });
 }
 
-export const calculateWeights = (x: number, y: number) => {
+export const weightCalculation = (x: number, y: number) => {
 	'use gpu';
 	const val = textureLoad(weightCalculationLayout.$.image, d.vec2u(x, y));
 	const tableSize = weightCalculationLayout.$.options.tableSize;
@@ -171,6 +171,7 @@ export const blur = (x: number, y: number, z: number) => {
 export const weightTextureFormat = 'rgba16float';
 
 export const filterOptions = d.struct({
+	textureSize: d.vec2u,
 	selectedColor: d.vec4f,
 	saturation: d.f32,
 	contrast: d.f32,
@@ -183,13 +184,14 @@ export const textureRenderLayout = tgpu.bindGroupLayout({
 });
 
 export const computeOptions = d.struct({
+	textureSize: d.vec2u,
 	tableSize: d.u32,
 })
 const WeightArray = d.arrayOf(d.atomic(d.u32));
 
 export const weightCalculationLayout = tgpu.bindGroupLayout({
 	options: { uniform: computeOptions },
-	image: { storageTexture: d.textureStorage2d('rgba8unorm', 'read-only') },
+	image: { storageTexture: d.textureStorage2d('rgba16float', 'read-only') },
 	weights: { storage: WeightArray, access: 'mutable' }
 })
 
@@ -212,6 +214,7 @@ export const cameraUniform = d.struct({
 	aspect: d.f32,
 	steps: d.u32,
 	sensitivity: d.f32,
+	bgColor: d.f32,
 });
 
 export const cameraBindLayout = tgpu.bindGroupLayout({
@@ -266,7 +269,8 @@ export const imageFragment = ({ uv }: { uv: d.v2f }) => {
 export const triangleFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof triangleFragmentOutput> => {
 	'use gpu';
 
-	const bg = d.vec4f(0.1, 0.1, 0.1, 1.0);
+	const bgLightness = cameraBindLayout.$.cameraUniform.bgColor;
+	const bg = d.vec4f(bgLightness, bgLightness, bgLightness, 1.0);
 
 	const center = d.vec3f(0.5, 0.5, 0.5);
 	const ray = cameraRay(
@@ -379,20 +383,3 @@ export const contrastFilter = (uv: d.v2f, color: d.v4f): d.v4f => {
 	oklab.x = std.mul((oklab.x - 0.5), contrast) + 0.5;
 	return d.vec4f(oklab_to_srgb(oklab), color.a);
 }
-
-
-// class ImageFilter {
-// 	root: TgpuRoot;
-// 	pipeline: TgpuGuardedComputePipeline;
-// 	constructor(root: TgpuRoot) {
-// 		this.root = root;
-// 	}
-
-// 	apply(inputTexture: TgpuTexture<StorageFlag>, outputTexture: TgpuTexture<StorageFlag>) {
-// 		const bindGroup = this.root.createBindGroup(textureRenderLayout, {
-// 			texture: inputTexture,
-// 			sampler: sampler
-// 		});
-// 		this.pipeline.with(bindGroup).dispatchThreads(inputTexture.size[0], inputTexture.size[1]);
-// 	}
-// }

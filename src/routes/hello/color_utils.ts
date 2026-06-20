@@ -43,7 +43,7 @@ export const oklab_to_linear_rgb = (color: d.v3f) => {
     const r = std.add(std.add(std.mul(d.f32(4.0767416621), l), std.mul(d.f32(-3.3077115913), m)), std.mul(d.f32(0.2309699292), s));
     const g = std.add(std.add(std.mul(d.f32(-1.2684380046), l), std.mul(d.f32(2.6097574011), m)), std.mul(d.f32(-0.3413193965), s));
     const b = std.add(std.add(std.mul(d.f32(-0.0041960863), l), std.mul(d.f32(-0.7034186147), m)), std.mul(d.f32(1.7076147010), s));
-    return std.clamp(d.vec3f(r, g, b), d.vec3f(0.0), d.vec3f(1.0));
+    return d.vec3f(r, g, b);
 }
 
 export const srgb_to_oklab = (color: d.v3f) => {
