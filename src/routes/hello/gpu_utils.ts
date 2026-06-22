@@ -1,4 +1,4 @@
-import type { TgpuBindGroup, TgpuBindGroupLayout, TgpuRoot } from "typegpu";
+import type { TgpuBindGroup, TgpuBindGroupLayout, TgpuRoot, ExtractBindGroupInputFromLayout, TgpuLayoutEntry } from "typegpu";
 
 const globalOnceMap = new Map<(...args: any[]) => void, any>();
 
@@ -40,11 +40,11 @@ const once2 = <V>(context: OnceMap<V>, keys: any[], fn: () => V): V => {
 
 const bindGroupMap: OnceMap<TgpuBindGroup<any>> = new Map();
 
-export const onceBindGroup = <T extends Record<string, any> = any>(root: TgpuRoot, bindGroupLayout: TgpuBindGroupLayout, entries: T) => {
-    const entryKeys = Object.keys(entries);
+export const onceBindGroup = <Entries extends Record<string, TgpuLayoutEntry | null>>(root: TgpuRoot, bindGroupLayout: TgpuBindGroupLayout<Entries>, entries: ExtractBindGroupInputFromLayout<Entries>) => {
+    const entryKeys = Object.keys(entries) as (keyof typeof entries)[];
     entryKeys.sort();
     const key = [bindGroupLayout, ...entryKeys.map((key) => entries[key])];
-    return once2<TgpuBindGroup<any>>(bindGroupMap, key, () => {
+    return once2<TgpuBindGroup<Entries>>(bindGroupMap, key, () => {
         return root.createBindGroup(
             bindGroupLayout,
             entries

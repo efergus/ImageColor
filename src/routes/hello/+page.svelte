@@ -16,6 +16,7 @@
 		type SampledFlag,
 		type StorageFlag,
 		type TgpuBuffer,
+		type TgpuFixedSampler,
 		type TgpuGuardedComputePipeline,
 		type TgpuQuerySet,
 		type TgpuRenderPipeline,
@@ -60,7 +61,8 @@
 		filterSlot,
 		filterBindLayout,
 		filterOptions,
-		textureRenderLayout
+		textureRenderLayout,
+		weightTextureFormat
 	} from './shaders';
 	import { once } from './gpu_utils';
 	import { select, textureDimensions } from 'typegpu/std';
@@ -68,7 +70,9 @@
 		calculateWeights,
 		filterTexture,
 		processWeightTexture,
-		blurWeightTexture
+		blurWeightTexture,
+		renderImage,
+		renderColorCloud
 	} from './orchestration';
 
 	let colorCanvas: HTMLCanvasElement;
@@ -92,6 +96,7 @@
 	let isHovering = $state(false);
 	let imageName = $state('Bee');
 	let hoveredRGB = d.vec3f(0.0, 0.0, 0.0);
+	let textureSize = $state(d.vec2u(128, 128));
 
 	let gpuState: {
 		root: TgpuRoot;
@@ -107,7 +112,7 @@
 		filteredTexture: TgpuTexture & RenderFlag & SampledFlag;
 		pickTexture: TgpuTexture & RenderFlag;
 		pickStagingBuffer: TgpuBuffer<d.WgslArray<d.U32>>;
-		linearSampler: GPUSampler;
+		linearSampler: TgpuFixedSampler;
 		querySet: TgpuQuerySet<'timestamp'>;
 		blurredWeightTexture: any;
 	} | null = null;
@@ -161,7 +166,6 @@
 		stagingBuffer.unmap();
 		stagingBuffer.destroy();
 		const endTime = performance.now();
-		console.log(`Texture read took ${(endTime - startTime).toFixed(2)} ms`);
 
 		return { data, width, height, bytesPerRow };
 	}
@@ -247,6 +251,7 @@
 		try {
 			const bitmap = await imageUrlToBitmap(url);
 			const texture = await bitmapToTexture(gpuState.root, bitmap);
+			// texture.generateMipmaps();
 			gpuState.imageBitmap = bitmap;
 			gpuState.imageTexture = texture;
 			gpuState.filteredTexture = texture;
@@ -288,7 +293,7 @@
 
 	const computeWeightTexture = (tableSize: number, encoder?: GPUCommandEncoder) => {
 		if (!gpuState) {
-			console.log('gpuState is null');
+			console.warn('gpuState is null');
 			return;
 		}
 
@@ -306,8 +311,6 @@
 		const _encoder = encoder ?? root.device.createCommandEncoder();
 
 		applyFilters();
-
-		const textureSize = d.vec2u(imageBitmap.width, imageBitmap.height);
 
 		// _encoder.clearBuffer(weightsBuffer.buffer, 0);
 		const weightsBuffer = calculateWeights(root, gpuState.filteredTexture, {
@@ -343,7 +346,7 @@
 
 	const renderScene = async (encoder?: GPUCommandEncoder) => {
 		if (!gpuState) {
-			console.log('gpuState is null');
+			console.warn('gpuState is null');
 			return;
 		}
 
@@ -373,69 +376,58 @@
 		const _encoder = encoder ?? root.device.createCommandEncoder();
 		const blurredWeightTexture = gpuState.blurredWeightTexture;
 
-		gpuState.filterOptionsBuffer.write({
-			textureSize: d.vec2u(imageBitmap.width, imageBitmap.height),
-			selectedColor: isHovering
-				? d.vec4f(hoveredRGB.x, hoveredRGB.y, hoveredRGB.z, 0.05)
-				: d.vec4f(0.0, 0.0, 0.0, 1000.0),
-			saturation: saturation,
-			contrast: contrast
+		const selectedColor = isHovering
+			? d.vec4f(hoveredRGB.x, hoveredRGB.y, hoveredRGB.z, 0.05)
+			: d.vec4f(0.0, 0.0, 0.0, 1000.0);
+
+		const pickView = (pickTexture as any).createView('render');
+		renderColorCloud(
+			root,
+			gpuState.blurredWeightTexture,
+			linearSampler,
+			context,
+			pickView,
+			{
+				textureSize,
+				saturation,
+				contrast,
+				selectedColor
+			},
+			{
+				yaw,
+				pitch,
+				radius,
+				aspect: colorCanvas.width / colorCanvas.height,
+				steps,
+				sensitivity,
+				bgColor
+			}
+		);
+
+		renderImage(root, filteredTexture, linearSampler, imageContext, {
+			textureSize,
+			saturation,
+			contrast,
+			selectedColor
 		});
-
-		cameraUniformBuffer.write({
-			yaw,
-			pitch,
-			radius,
-			aspect: colorCanvas.width / colorCanvas.height,
-			steps,
-			sensitivity,
-			bgColor
-		});
-
-		const textureBindGroup = root.createBindGroup(textureRenderLayout, {
-			texture: filteredTexture,
-			sampler: linearSampler,
-			options: gpuState.filterOptionsBuffer
-		});
-
-		const bindGroup = root.createBindGroup(cameraBindLayout, {
-			cameraUniform: cameraUniformBuffer,
-			options: gpuState.filterOptionsBuffer,
-			weightTexture: blurredWeightTexture as any,
-			weightSampler: linearSampler
-		});
-
-		renderPipeline
-			.with(bindGroup)
-			.with(_encoder)
-			.withColorAttachment({
-				color: { view: context },
-				pick: { view: (pickTexture as any).createView('render') }
-			})
-			.draw(6);
-
-		imageRenderPipeline
-			.with(textureBindGroup)
-			.withColorAttachment({ view: imageContext } as any)
-			.draw(6);
 
 		if (!encoder) {
 			root.device.queue.submit([_encoder.finish()]);
 		}
 		await root.device.queue.onSubmittedWorkDone();
 
-		if (querySet.available) {
-			querySet.resolve();
-			const values = await querySet.read();
-			for (let i = 0; i < 16; i += 2) {
-				const start = values[i];
-				const end = values[i + 1];
-				const time = Number(end - start);
-				console.log(`Pass ${i / 2}: ${time / 1e6} ms`);
-			}
-		} else {
-			console.warn('querySet not available');
-		}
+		// if (querySet.available) {
+		// 	querySet.resolve();
+		// 	const values = await querySet.read();
+		// 	for (let i = 0; i < 16; i += 2) {
+		// 		const start = values[i];
+		// 		const end = values[i + 1];
+		// 		const time = Number(end - start);
+		// 		console.log(`Pass ${i / 2}: ${time / 1e6} ms`);
+		// 	}
+		// } else {
+		// 	console.warn('querySet not available');
+		// }
 		requestAnimationFrame(() => renderScene());
 	};
 
@@ -475,7 +467,7 @@
 				.createBuffer(d.arrayOf(d.u32, 64))
 				.$addFlags(GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
 
-			const sampler = root.device.createSampler({
+			const sampler = root.createSampler({
 				magFilter: 'linear',
 				minFilter: 'linear'
 			});
@@ -510,12 +502,14 @@
 					endOfPassWriteIndex: 9
 				});
 
+			textureSize = d.vec2u(bitmap.width, bitmap.height);
+
 			const optionsBuffer = root.createBuffer(computeOptions).$usage('uniform');
-			optionsBuffer.write({ textureSize: d.vec2u(bitmap.width, bitmap.height), tableSize });
+			optionsBuffer.write({ textureSize, tableSize });
 
 			const filterOptionsBuffer = root.createBuffer(filterOptions).$usage('uniform');
 			filterOptionsBuffer.write({
-				textureSize: d.vec2u(bitmap.width, bitmap.height),
+				textureSize,
 				selectedColor: d.vec4f(0.0, 0.0, 0.0, 1000.0),
 				saturation: saturation,
 				contrast: contrast

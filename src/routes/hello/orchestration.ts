@@ -1,6 +1,6 @@
 import { d, type StorageFlag, type TgpuBuffer, type TgpuFixedSampler, type TgpuQuerySet, type TgpuRenderPipeline, type TgpuRoot, type TgpuTexture } from "typegpu";
 import { once, onceBindGroup } from "./gpu_utils";
-import { computeOptions, filterBindLayout, filterFragment, filterOptions, quadVertex, textureRenderLayout, weightCalculation, weightCalculationLayout, processWeights, weightTransferLayout, weightTextureFormat, blur, weightProcessingLayout } from "./shaders";
+import { computeOptions, filterBindLayout, filterFragment, filterOptions, quadVertex, textureRenderLayout, weightCalculation, weightCalculationLayout, processWeights, weightTransferLayout, weightTextureFormat, blur, weightProcessingLayout, imageFragment, triangleFragment, cameraBindLayout, cameraUniform } from "./shaders";
 import { textureDimensions } from "typegpu/std";
 
 let querySet: TgpuQuerySet<'timestamp'> | null = null;
@@ -55,7 +55,7 @@ export const filterTexture = (root: TgpuRoot, inputTexture: TgpuTexture, inputSa
     optionsBuffer.write(options);
 
     const filterBindGroup = onceBindGroup(root, filterBindLayout, {
-        texture: inputTexture,
+        texture: inputTexture as any,
         sampler: inputSampler,
         filterOptions: optionsBuffer
     })
@@ -90,7 +90,7 @@ export const calculateWeights = (root: TgpuRoot, inputTexture: TgpuTexture, opti
     outputBuffer.clear();
 
     const bindGroup = onceBindGroup(root, weightCalculationLayout, {
-        image: inputTexture,
+        image: (inputTexture as any),
         weights: outputBuffer,
         options: optionsBuffer
     });
@@ -100,7 +100,7 @@ export const calculateWeights = (root: TgpuRoot, inputTexture: TgpuTexture, opti
     return outputBuffer;
 }
 
-export const processWeightTexture = (root: TgpuRoot, weightsBuffer: TgpuBuffer<d.WgslArray<d.U32>>, options: d.Infer<typeof computeOptions>) => {
+export const processWeightTexture = (root: TgpuRoot, weightsBuffer: TgpuBuffer<d.WgslArray<d.U32>> & StorageFlag, options: d.Infer<typeof computeOptions>) => {
     const {
         pipeline,
         optionsBuffer,
@@ -166,4 +166,76 @@ export const blurWeightTexture = (root: TgpuRoot, inputTexture: TgpuTexture, opt
     pipeline.with(bindGroup).dispatchThreads(tableSize, tableSize, tableSize);
 
     return outputTexture;
+}
+
+export const renderImage = (root: TgpuRoot, inputTexture: TgpuTexture, inputSampler: TgpuFixedSampler, outputView: any, options: d.Infer<typeof filterOptions>) => {
+    const {
+        pipeline,
+        optionsBuffer
+    } = once(renderImage, () => {
+        const pipeline = root
+            .createRenderPipeline({
+                primitive: { topology: 'triangle-list' },
+                vertex: quadVertex,
+                fragment: imageFragment
+            }).withTimestampWrites(timestampOptions(root, 'renderImage'));
+        const optionsBuffer = root.createBuffer(filterOptions).$usage('uniform');
+        return { pipeline, optionsBuffer };
+    });
+
+    const bindGroup = onceBindGroup(root, textureRenderLayout, {
+        texture: (inputTexture as any).createView('sampled'),
+        sampler: inputSampler,
+        options: optionsBuffer
+    });
+
+    optionsBuffer.write(options);
+
+    pipeline.with(bindGroup).withColorAttachment({
+        view: outputView
+    }).draw(6);
+}
+
+export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inputSampler: TgpuFixedSampler, outputView: any, pickView: any, options: d.Infer<typeof filterOptions>, camera: d.Infer<typeof cameraUniform>) => {
+    const {
+        pipeline,
+        optionsBuffer,
+        cameraBuffer
+    } = once(renderColorCloud, () => {
+        const pipeline = root
+            .createRenderPipeline({
+                primitive: { topology: 'triangle-list' },
+                vertex: quadVertex,
+                fragment: triangleFragment,
+                targets: {
+                    color: { format: navigator.gpu.getPreferredCanvasFormat() },
+                    pick: { format: 'rgba8unorm' }
+                }
+            }).withTimestampWrites(timestampOptions(root, 'renderColorCloud'));
+        const optionsBuffer = root.createBuffer(filterOptions).$usage('uniform');
+        const cameraBuffer = root.createBuffer(cameraUniform).$usage('uniform');
+        return { pipeline, optionsBuffer, cameraBuffer };
+    });
+
+    const bindGroup = onceBindGroup(root, textureRenderLayout, {
+        texture: (inputTexture as any).createView('sampled'),
+        sampler: inputSampler,
+        options: optionsBuffer
+    });
+
+    const cameraBindGroup = onceBindGroup(root, cameraBindLayout, {
+        options: optionsBuffer,
+        cameraUniform: cameraBuffer,
+        weightTexture: (inputTexture as any).createView('sampled'),
+        weightSampler: inputSampler
+    })
+
+    optionsBuffer.write(options);
+    cameraBuffer.write(camera);
+
+    pipeline.with(bindGroup).with(cameraBindGroup)
+        .withColorAttachment({
+            color: { view: outputView },
+            pick: { view: pickView }
+        }).draw(6);
 }

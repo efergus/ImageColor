@@ -248,11 +248,6 @@ export const quadVertex = ({ $vertexIndex: vid }: { $vertexIndex: number }) => {
 	};
 };
 
-export const triangleFragmentOutput = d.struct({
-	color: d.vec4f,
-	pick: d.vec4f,
-})
-
 export const imageFragment = ({ uv }: { uv: d.v2f }) => {
 	'use gpu';
 	const original = textureSample(textureRenderLayout.$.texture, textureRenderLayout.$.sampler, uv);
@@ -261,10 +256,14 @@ export const imageFragment = ({ uv }: { uv: d.v2f }) => {
 	const originalOklab = srgb_to_oklab(original.rgb);
 
 	const greyness = std.clamp((std.distance(targetColorOklab, originalOklab) - targetDistance) * 100.0, 0.0, 0.8);
-	const grey = std.dot(original.rgb, d.vec3f(0.299, 0.587, 0.114));
 	const outColor = std.mix(original.rgb, d.vec3f(0.4), d.f32(greyness));
 	return d.vec4f(outColor, original.a);
 }
+
+export const triangleFragmentOutput = d.struct({
+	color: d.vec4f,
+	pick: d.vec4f,
+});
 
 export const triangleFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof triangleFragmentOutput> => {
 	'use gpu';
