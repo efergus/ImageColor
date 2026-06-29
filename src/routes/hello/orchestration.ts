@@ -1,7 +1,8 @@
 import { d, type StorageFlag, type TgpuBuffer, type TgpuFixedSampler, type TgpuQuerySet, type TgpuRenderPipeline, type TgpuRoot, type TgpuTexture } from "typegpu";
 import { once, onceBindGroup } from "./gpu_utils";
-import { computeOptions, filterBindLayout, filterFragment, filterOptions, quadVertex, textureRenderLayout, weightCalculation, weightCalculationLayout, processWeights, weightTransferLayout, weightTextureFormat, blur, weightProcessingLayout, imageFragment, triangleFragment, cameraBindLayout, cameraUniform } from "./shaders";
+import { computeOptions, filterBindLayout, filterFragment, filterOptions, quadVertex, textureRenderLayout, weightCalculation, weightCalculationLayout, processWeights, weightTransferLayout, weightTextureFormat, blur, weightProcessingLayout, imageFragment, triangleFragment, cameraBindLayout, cameraUniform, colorSpaceSlot, linearRgbColorSpace, srgbColorSpace, oklabColorSpace, colorSpaceInverseSlot, linearRgbColorSpaceInverse, srgbColorSpaceInverse, oklabColorSpaceInverse } from "./shaders";
 import { textureDimensions } from "typegpu/std";
+import { ColorSpace } from "./color_utils";
 
 let querySet: TgpuQuerySet<'timestamp'> | null = null;
 let querySetNames: Map<string, number> = new Map()
@@ -26,7 +27,39 @@ const timestampOptions = (root: TgpuRoot, name: string) => {
     }
 }
 
+let querySetTimings: Map<string, number[]> = new Map();
+
+export const readTimings = async () => {
+    if (!querySet) {
+        console.warn('Query set not available')
+        return;
+    }
+    if (querySet.available) {
+        querySet.resolve();
+        const values = await querySet.read();
+        for (const name of querySetNames.keys()) {
+            const index = querySetNames.get(name)! * 2;
+
+            const start = values[index];
+            const end = values[index + 1];
+            const time = Number(end - start);
+            const past = querySetTimings.get(name) ?? [];
+            if (past.length && past[past.length - 1] === time) {
+                continue;
+            }
+
+            past.push(time);
+            querySetTimings.set(name, past);
+            console.log(`Pass ${name}: ${time / 1e6} ms`);
+        }
+    } else {
+        console.warn('querySet not available');
+    }
+}
+
 export const filterTexture = (root: TgpuRoot, inputTexture: TgpuTexture, inputSampler: TgpuFixedSampler, options: d.Infer<typeof filterOptions>) => {
+    const format = 'rgba16float';
+
     const {
         optionsBuffer,
         pipeline
@@ -36,7 +69,7 @@ export const filterTexture = (root: TgpuRoot, inputTexture: TgpuTexture, inputSa
             vertex: quadVertex,
             fragment: filterFragment,
             targets: {
-                color: { format: 'rgba16float' }
+                color: { format }
             }
         }).withTimestampWrites(timestampOptions(root, 'filterTexture'));
         const optionsBuffer = root.createBuffer(filterOptions).$usage('uniform');
@@ -46,7 +79,7 @@ export const filterTexture = (root: TgpuRoot, inputTexture: TgpuTexture, inputSa
     const { outputTexture, outputView } = once([filterTexture, options.textureSize.x, options.textureSize.y], () => {
         const outputTexture = root.createTexture({
             size: [options.textureSize.x, options.textureSize.y],
-            format: 'rgba16float',
+            format,
         }).$usage('render', 'sampled', 'storage');
         const outputView = outputTexture.createView('render');
         return { outputTexture, outputView }
@@ -67,12 +100,15 @@ export const filterTexture = (root: TgpuRoot, inputTexture: TgpuTexture, inputSa
     return outputTexture;
 }
 
-export const calculateWeights = (root: TgpuRoot, inputTexture: TgpuTexture, options: d.Infer<typeof computeOptions>) => {
+export const calculateWeights = (root: TgpuRoot, inputTexture: TgpuTexture, colorSpace: ColorSpace, options: d.Infer<typeof computeOptions>) => {
     const {
         pipeline,
         optionsBuffer,
-    } = once(calculateWeights, () => {
-        const pipeline = root.createGuardedComputePipeline(weightCalculation).withTimestampWrites(timestampOptions(root, 'calculateWeights'))
+    } = once([calculateWeights, colorSpace], () => {
+        const pipeline = root
+            .with(colorSpaceSlot, colorSpaceMap[colorSpace])
+            .createGuardedComputePipeline(weightCalculation)
+            .withTimestampWrites(timestampOptions(root, 'calculateWeights'))
         const optionsBuffer = root.createBuffer(computeOptions).$usage('uniform');
         return { pipeline, optionsBuffer };
     });
@@ -157,9 +193,13 @@ export const blurWeightTexture = (root: TgpuRoot, inputTexture: TgpuTexture, opt
 
     optionsBuffer.write(options);
 
+    const inputTextureView = once([blurWeightTexture, inputTexture], () => {
+        return (inputTexture as any).createView('sampled');
+    });
+
     const bindGroup = onceBindGroup(root, weightProcessingLayout, {
         options: optionsBuffer,
-        inputTexture: (inputTexture as any).createView('sampled'),
+        inputTexture: inputTextureView,
         outputTexture: outputTexture as any
     });
 
@@ -183,8 +223,12 @@ export const renderImage = (root: TgpuRoot, inputTexture: TgpuTexture, inputSamp
         return { pipeline, optionsBuffer };
     });
 
+    const inputTextureView = once([renderImage, inputTexture], () => {
+        return (inputTexture as any).createView('sampled');
+    });
+
     const bindGroup = onceBindGroup(root, textureRenderLayout, {
-        texture: (inputTexture as any).createView('sampled'),
+        texture: inputTextureView,
         sampler: inputSampler,
         options: optionsBuffer
     });
@@ -196,13 +240,29 @@ export const renderImage = (root: TgpuRoot, inputTexture: TgpuTexture, inputSamp
     }).draw(6);
 }
 
-export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inputSampler: TgpuFixedSampler, outputView: any, pickView: any, options: d.Infer<typeof filterOptions>, camera: d.Infer<typeof cameraUniform>) => {
+
+
+const colorSpaceMap = {
+    [ColorSpace.srgb]: srgbColorSpace,
+    [ColorSpace.linear_rgb]: linearRgbColorSpace,
+    [ColorSpace.oklab]: oklabColorSpace,
+}
+
+const colorSpaceInverseMap = {
+    [ColorSpace.srgb]: srgbColorSpaceInverse,
+    [ColorSpace.linear_rgb]: linearRgbColorSpaceInverse,
+    [ColorSpace.oklab]: oklabColorSpaceInverse,
+}
+
+export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inputSampler: TgpuFixedSampler, outputView: any, pickView: any, colorSpace: ColorSpace, options: d.Infer<typeof filterOptions>, camera: d.Infer<typeof cameraUniform>) => {
     const {
         pipeline,
         optionsBuffer,
         cameraBuffer
-    } = once(renderColorCloud, () => {
+    } = once([renderColorCloud, colorSpace], () => {
         const pipeline = root
+            .with(colorSpaceSlot, colorSpaceMap[colorSpace])
+            .with(colorSpaceInverseSlot, colorSpaceInverseMap[colorSpace])
             .createRenderPipeline({
                 primitive: { topology: 'triangle-list' },
                 vertex: quadVertex,
@@ -217,8 +277,12 @@ export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inpu
         return { pipeline, optionsBuffer, cameraBuffer };
     });
 
+    const inputTextureView = once([renderColorCloud, inputTexture], () => {
+        return (inputTexture as any).createView('sampled');
+    });
+
     const bindGroup = onceBindGroup(root, textureRenderLayout, {
-        texture: (inputTexture as any).createView('sampled'),
+        texture: inputTextureView,
         sampler: inputSampler,
         options: optionsBuffer
     });
@@ -226,7 +290,7 @@ export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inpu
     const cameraBindGroup = onceBindGroup(root, cameraBindLayout, {
         options: optionsBuffer,
         cameraUniform: cameraBuffer,
-        weightTexture: (inputTexture as any).createView('sampled'),
+        weightTexture: inputTextureView,
         weightSampler: inputSampler
     })
 

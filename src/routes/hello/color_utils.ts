@@ -1,5 +1,11 @@
 import tgpu, { d, std } from 'typegpu';
 
+export enum ColorSpace {
+    srgb = 'srgb',
+    linear_rgb = 'linear_rgb',
+    oklab = 'oklab'
+};
+
 export const srgb_to_linear_rgb = (color: d.v3f) => {
     'use gpu';
     const b = std.le(color, d.vec3f(0.04045));

@@ -1,6 +1,6 @@
 import tgpu, { d, std } from 'typegpu';
 import { textureSample, textureLoad, textureSampleLevel, textureDimensions } from 'typegpu/std';
-import { linear_rgb_to_oklab, linear_rgb_to_srgb, oklab_to_linear_rgb, oklab_to_srgb, srgb_to_linear_rgb, srgb_to_oklab } from './color_utils';
+import { ColorSpace, linear_rgb_to_oklab, linear_rgb_to_srgb, oklab_to_linear_rgb, oklab_to_srgb, srgb_to_linear_rgb, srgb_to_oklab } from './color_utils';
 import { randf } from '@typegpu/noise';
 
 const rotX = (pitch: number) => {
@@ -86,23 +86,57 @@ export const cameraRay = (uv: d.v2f, yaw: number, pitch: number, radius: number,
 	return RayStruct({ start: eye, direction });
 }
 
+export const colorSpaceSlot = tgpu.slot<(color: d.v3f) => d.v3f>();
+export const colorSpaceInverseSlot = tgpu.slot<(color: d.v3f) => d.v3f>();
+
+export const srgbColorSpace = (color: d.v3f) => {
+	'use gpu';
+	return d.vec3f(color);
+}
+
+export const linearRgbColorSpace = (color: d.v3f) => {
+	'use gpu';
+	return srgb_to_linear_rgb(color);
+}
+
+export const oklabColorSpace = (color: d.v3f) => {
+	'use gpu';
+	const raw = srgb_to_oklab(color);
+	const transformed = d.vec3f(raw.y + 0.5, raw.x, raw.z + 0.5);
+	return transformed;
+}
+
+export const srgbColorSpaceInverse = (color: d.v3f) => {
+	'use gpu';
+	return d.vec3f(color);
+}
+
+export const linearRgbColorSpaceInverse = (color: d.v3f) => {
+	'use gpu';
+	return linear_rgb_to_srgb(color);
+}
+
+export const oklabColorSpaceInverse = (color: d.v3f) => {
+	'use gpu';
+	const raw = d.vec3f(color.y, color.x - 0.5, color.z - 0.5);
+	const transformed = oklab_to_srgb(raw);
+	return transformed;
+}
+
 export const weightCalculation = (x: number, y: number) => {
 	'use gpu';
 	const val = textureLoad(weightCalculationLayout.$.image, d.vec2u(x, y));
+	const colorSpace = colorSpaceSlot.$(val.xyz);
 	const tableSize = weightCalculationLayout.$.options.tableSize;
-	const oklab = srgb_to_oklab(val.xyz);
-	const x_ = d.u32(std.round((oklab.y + 0.5) * d.f32(tableSize - 1)));
-	const y_ = d.u32(std.round(oklab.x * d.f32(tableSize - 1)));
-	const z_ = d.u32(std.round((oklab.z + 0.5) * d.f32(tableSize - 1)));
-	// const x_ = d.u32(std.floor(val.x * d.f32(tableSize - 2)));
-	// const y_ = d.u32(std.floor(val.y * d.f32(tableSize - 2)));
-	// const z_ = d.u32(std.floor(val.z * d.f32(tableSize - 2)));
-	const val_255 = std.ceil(std.mul(val, d.f32(255.0)));
+	const x_ = d.u32(std.round(colorSpace.x * d.f32(tableSize - 1)));
+	const y_ = d.u32(std.round(colorSpace.y * d.f32(tableSize - 1)));
+	const z_ = d.u32(std.round(colorSpace.z * d.f32(tableSize - 1)));
+	const colorSpace_255 = std.ceil(std.mul(colorSpace, d.f32(255.0)));
 	const idx = x_ + y_ * tableSize + z_ * tableSize * tableSize;
 	const byteOffset = idx * 4;
-	std.atomicAdd(weightCalculationLayout.$.weights[byteOffset + 0], d.u32(val_255.r)); // val_255.x
-	std.atomicAdd(weightCalculationLayout.$.weights[byteOffset + 1], d.u32(val_255.g)); // val_255.y
-	std.atomicAdd(weightCalculationLayout.$.weights[byteOffset + 2], d.u32(val_255.b)); // val_255.z
+	std.atomicAdd(weightCalculationLayout.$.weights[byteOffset + 0], d.u32(colorSpace_255.x));
+	std.atomicAdd(weightCalculationLayout.$.weights[byteOffset + 1], d.u32(colorSpace_255.y));
+	std.atomicAdd(weightCalculationLayout.$.weights[byteOffset + 2], d.u32(colorSpace_255.z));
 	std.atomicAdd(weightCalculationLayout.$.weights[byteOffset + 3], d.u32(1));
 }
 
@@ -120,13 +154,18 @@ export const processWeights = (x: number, y: number, z: number) => {
 	const count = weightTransferLayout.$.weights[byteOffset + 3];
 
 	const countf = std.max(d.f32(1.0), d.f32(count));
-	const rgb = d.vec3f(
+	const rgb = d.vec4f(
 		d.f32(r) / countf / 255.0,
 		d.f32(g) / countf / 255.0,
-		d.f32(b) / countf / 255.0
+		d.f32(b) / countf / 255.0,
+		count
 	);
 
-	std.textureStore(weightTransferLayout.$.outputTexture, d.vec3u(x, y, z), d.vec4f(srgb_to_oklab(rgb), count));
+	const tableSizef = d.f32(tableSize - 1);
+	const alt = d.vec4f(d.f32(x) / tableSizef, d.f32(y) / tableSizef, d.f32(z) / tableSizef, 0.0);
+	const finalColor = std.mix(alt, rgb, std.min(d.f32(count), 1.0));
+
+	std.textureStore(weightTransferLayout.$.outputTexture, d.vec3u(x, y, z), finalColor);
 }
 
 export const blurKernel = (x: number, y: number, z: number) => {
@@ -150,16 +189,8 @@ export const blurKernel = (x: number, y: number, z: number) => {
 	// 		}
 	// 	}
 	// }
-	const textureSize = textureDimensions(weightProcessingLayout.$.inputTexture);
-	const position = std.div(d.vec3f(x, y, z), d.vec3f(textureSize.x, textureSize.y, textureSize.z));
-	const oklab = std.sub(position.yxz, d.vec3f(0.0, 0.5, 0.5));
 	const originalColor = textureLoad(weightProcessingLayout.$.inputTexture, d.vec3u(x, y, z), 0);
-	if (originalColor.a <= 0.0) {
-		return d.vec4f(oklab, 0.0);
-	}
-	// return d.vec4f(color, originalColor.a);
 	return originalColor;
-	// return std.div(accumulated, std.max(total, 0.0001)); // d.f32(weights[0] * 1 + weights[1] * 6 + weights[2] * 8 + weights[3] * 8)
 }
 
 export const blur = (x: number, y: number, z: number) => {
@@ -301,7 +332,7 @@ export const triangleFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof triangle
 	let acc = d.vec4f(0.0, 0.0, 0.0, 0.0);
 	const sensitivity = cameraBindLayout.$.cameraUniform.sensitivity;
 	const wRange = std.max(sensitivity, d.f32(0.0001));
-	const targetColorOklab = srgb_to_oklab(cameraBindLayout.$.options.selectedColor.rgb);
+	const targetColorSpaceColor = colorSpaceSlot.$(cameraBindLayout.$.options.selectedColor.rgb);
 	const targetDistance = cameraBindLayout.$.options.selectedColor.a;
 
 	for (let i = 0; i < steps; i++) {
@@ -315,7 +346,7 @@ export const triangleFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof triangle
 		// 	continue;
 		// }
 
-		const outside = std.distance(targetColorOklab, sample.rgb) < targetDistance;
+		const outside = std.distance(targetColorSpaceColor, sample.rgb) < targetDistance;
 		keep = std.mul(keep, std.max(0.3, d.f32(outside)));
 
 
@@ -333,13 +364,13 @@ export const triangleFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof triangle
 	}
 
 	const keepPick = d.f32(acc.w > 0.0);
-	const pureColorOklab = std.div(acc.xyz, std.max(d.f32(0.0001), acc.w));
-	const pureColorRgb = oklab_to_srgb(pureColorOklab);
-	const colorRgb = std.add(std.mul(pureColorRgb, acc.w), std.mul(bg.xyz, std.sub(d.f32(1.0), acc.w)));
+	const pureColorSpaceColor = std.div(acc.xyz, std.max(d.f32(0.0001), acc.w));
+	const pureColor = colorSpaceInverseSlot.$(pureColorSpaceColor);
+	const colorRgb = std.add(std.mul(pureColor, acc.w), std.mul(bg.xyz, std.sub(d.f32(1.0), acc.w)));
 
 	return {
 		color: d.vec4f(colorRgb, 1.0),
-		pick: std.mul(d.vec4f(pureColorRgb, 1.0), keepPick),
+		pick: std.mul(d.vec4f(pureColor, 1.0), keepPick),
 	};
 };
 

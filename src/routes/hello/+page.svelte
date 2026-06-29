@@ -43,77 +43,58 @@
 	];
 
 	import {
-		quadVertex,
-		triangleFragment,
-		cameraBindLayout,
-		cameraUniform,
-		weightCalculation,
-		computeOptions,
-		weightCalculationLayout,
-		processWeights,
-		weightTransferLayout,
-		imageFragment,
-		cameraRay,
-		blur,
-		weightProcessingLayout,
-		filterFragment,
-		saturationFilter,
-		filterSlot,
-		filterBindLayout,
-		filterOptions,
-		textureRenderLayout,
-		weightTextureFormat
-	} from './shaders';
-	import { once } from './gpu_utils';
-	import { select, textureDimensions } from 'typegpu/std';
-	import {
 		calculateWeights,
 		filterTexture,
 		processWeightTexture,
 		blurWeightTexture,
 		renderImage,
-		renderColorCloud
+		renderColorCloud,
+		readTimings
 	} from './orchestration';
+	import { once } from './gpu_utils';
+	import { ColorSpace, oklab_to_srgb, srgb_to_oklab } from './color_utils';
+
+	const colorSpaces = [
+		{ value: ColorSpace.srgb, label: 'sRGB' },
+		{ value: ColorSpace.linear_rgb, label: 'Linear RGB' },
+		{ value: ColorSpace.oklab, label: 'Oklab' }
+	];
 
 	let colorCanvas: HTMLCanvasElement;
 	let imageCanvas: HTMLCanvasElement;
-	let animationFrameId: number;
 	let updated = $state(0.0);
 	let filterUpdated = $state(0.0);
 	let filterCalculated = $state(0.0);
-	let yaw = $state(0.0);
+	let yaw = $state(0.4);
 	let pitch = $state(0.2);
-	let radius = $state(2);
+	let radius = $state(1);
 	let steps = $state(24);
 	let sensitivitySlider = $state(3.0);
-	let sensitivity = $derived(sensitivitySlider === 0 ? 0 : Math.pow(10, sensitivitySlider - 2));
+	let sensitivity = $derived(sensitivitySlider === 6 ? 0 : Math.pow(10, 3 - sensitivitySlider));
 	let bgColor = $state(0.2);
 	let saturation = $state(1.0);
 	let contrast = $state(1.0);
-	let tableSize = $state(64);
-	let tableSizeStr = $state('64');
+	let tableSize = $state(128);
+	let tableSizeStr = $state('128');
+	let colorSpace = $state(ColorSpace.oklab);
 	let color = $state('rgba(0, 0, 0, 1)');
 	let isHovering = $state(false);
 	let imageName = $state('Bee');
-	let hoveredRGB = d.vec3f(0.0, 0.0, 0.0);
+	let hoveredRGB = $state(d.vec3f(0.0, 0.0, 0.0));
+	let contrastRGB = $state(d.vec3f(0.0, 0.0, 0.0));
 	let textureSize = $state(d.vec2u(128, 128));
+	let startTime = $state(0);
+	let savedRGB: d.v3f | null = $state(null);
 
 	let gpuState: {
 		root: TgpuRoot;
-		renderPipeline: any;
-		imageRenderPipeline: any;
 		context: GPUCanvasContext;
 		imageContext: GPUCanvasContext;
-		optionsBuffer: TgpuBuffer<typeof computeOptions> & UniformFlag;
-		cameraUniformBuffer: TgpuBuffer<typeof cameraUniform> & UniformFlag;
-		filterOptionsBuffer: TgpuBuffer<typeof filterOptions> & UniformFlag;
 		imageBitmap: ImageBitmap;
 		imageTexture: TgpuTexture & StorageFlag & SampledFlag;
 		filteredTexture: TgpuTexture & RenderFlag & SampledFlag;
-		pickTexture: TgpuTexture & RenderFlag;
 		pickStagingBuffer: TgpuBuffer<d.WgslArray<d.U32>>;
 		linearSampler: TgpuFixedSampler;
-		querySet: TgpuQuerySet<'timestamp'>;
 		blurredWeightTexture: any;
 	} | null = null;
 
@@ -160,14 +141,26 @@
 		]);
 		root.device.queue.submit([enc.finish()]);
 
-		const startTime = performance.now();
 		await stagingBuffer.mapAsync(GPUMapMode.READ);
 		const data = new Uint8Array(stagingBuffer.getMappedRange().slice(0));
 		stagingBuffer.unmap();
 		stagingBuffer.destroy();
-		const endTime = performance.now();
 
 		return { data, width, height, bytesPerRow };
+	}
+
+	function rgbToCssColor(rgba: { r: number; g: number; b: number; a?: number }) {
+		return `rgba(${rgba.r * 255} ${rgba.g * 255} ${rgba.b * 255} / ${rgba.a ?? 1})`;
+	}
+
+	function rgbToHexColor(rgba: { r: number; g: number; b: number; a?: number }) {
+		return `#${Math.round(rgba.r * 255)
+			.toString(16)
+			.padStart(2, '0')}${Math.round(rgba.g * 255)
+			.toString(16)
+			.padStart(2, '0')}${Math.round(rgba.b * 255)
+			.toString(16)
+			.padStart(2, '0')}`;
 	}
 
 	async function readColorAtPixel(texture: TgpuTexture, px: number, py: number) {
@@ -176,7 +169,14 @@
 		let cache: { data: Uint8Array; width: number; height: number; bytesPerRow: number } | null =
 			null;
 
-		if (texture === gpuState.pickTexture) {
+		const pickTexture = getTexture(
+			gpuState.root,
+			'pickTexture',
+			colorCanvas.width,
+			colorCanvas.height
+		);
+
+		if (texture === pickTexture) {
 			if (!pickTextureCache) {
 				isReadingBack = true;
 				try {
@@ -209,25 +209,10 @@
 
 		if (isFloat16) {
 			const view = new DataView(cache.data.buffer, cache.data.byteOffset + offset, 8);
-			// Very basic float16 decode (fallback if getFloat16 is missing in TS)
-			const decodeF16 = (val: number) => {
-				const exp = (val & 0x7c00) >> 10;
-				const frac = val & 0x03ff;
-				return (
-					(val & 0x8000 ? -1 : 1) *
-					(exp === 0
-						? Math.pow(2, -14) * (frac / 1024)
-						: exp === 0x1f
-							? frac
-								? NaN
-								: Infinity
-							: Math.pow(2, exp - 15) * (1 + frac / 1024))
-				);
-			};
-			const r = decodeF16(view.getUint16(0, true)) * 255;
-			const g = decodeF16(view.getUint16(2, true)) * 255;
-			const b = decodeF16(view.getUint16(4, true)) * 255;
-			const a = decodeF16(view.getUint16(6, true)) * 255;
+			const r = view.getFloat16(0, true) * 255;
+			const g = view.getFloat16(2, true) * 255;
+			const b = view.getFloat16(4, true) * 255;
+			const a = view.getFloat16(6, true) * 255;
 			return d.vec4i(r, g, b, a);
 		}
 
@@ -259,7 +244,7 @@
 
 			invalidateCaches();
 			const encoder = gpuState.root.device.createCommandEncoder();
-			computeWeightTexture(tableSize, encoder);
+			computeWeightTexture(tableSize);
 			updated = Date.now();
 			gpuState.root.device.queue.submit([encoder.finish()]);
 		} catch (e) {
@@ -291,29 +276,36 @@
 		return texture;
 	};
 
-	const computeWeightTexture = (tableSize: number, encoder?: GPUCommandEncoder) => {
+	const getTexture = (root: TgpuRoot, uniqueName: string, width: number, height: number) =>
+		once([getTexture, uniqueName, width, height], () =>
+			root
+				.createTexture({
+					size: [width, height],
+					format: 'rgba8unorm'
+				})
+				.$usage('render', 'sampled')
+		);
+
+	const computeWeightTexture = (tableSize: number) => {
 		if (!gpuState) {
 			console.warn('gpuState is null');
 			return;
 		}
 
-		const {
-			root,
-			renderPipeline,
-			optionsBuffer,
-			imageBitmap,
-			imageTexture,
-			cameraUniformBuffer,
-			linearSampler,
-			filteredTexture
-		} = gpuState;
+		const { root } = gpuState;
 
-		const _encoder = encoder ?? root.device.createCommandEncoder();
+		const imageTexture = gpuState.imageTexture;
 
-		applyFilters();
+		const filteredImageTexture = filterTexture(root, imageTexture, gpuState.linearSampler, {
+			textureSize: textureSize,
+			selectedColor: d.vec4f(0.0, 0.0, 0.0, 1000.0),
+			saturation: saturation,
+			contrast: contrast
+		});
 
-		// _encoder.clearBuffer(weightsBuffer.buffer, 0);
-		const weightsBuffer = calculateWeights(root, gpuState.filteredTexture, {
+		gpuState.filteredTexture = filteredImageTexture;
+
+		const weightsBuffer = calculateWeights(root, gpuState.filteredTexture, colorSpace, {
 			tableSize: tableSize,
 			textureSize: textureSize
 		});
@@ -323,28 +315,23 @@
 			textureSize: textureSize
 		});
 
-		gpuState.blurredWeightTexture = blurWeightTexture(
-			root,
-			weightTexture,
-			{
-				textureSize: textureSize,
-				selectedColor: isHovering
-					? d.vec4f(hoveredRGB.x, hoveredRGB.y, hoveredRGB.z, 0.05)
-					: d.vec4f(0.0, 0.0, 0.0, 1000.0),
-				saturation: saturation,
-				contrast: contrast
-			},
-			tableSize
-		);
-
-		if (!encoder) {
-			root.device.queue.submit([_encoder.finish()]);
-		}
+		// gpuState.blurredWeightTexture = blurWeightTexture(
+		// 	root,
+		// 	weightTexture,
+		// 	{
+		// 		textureSize: textureSize,
+		// 		selectedColor: d.vec4f(0.0, 0.0, 0.0, 1000.0),
+		// 		saturation: saturation,
+		// 		contrast: contrast
+		// 	},
+		// 	tableSize
+		// );
+		gpuState.blurredWeightTexture = weightTexture;
 
 		filterCalculated = filterUpdated;
 	};
 
-	const renderScene = async (encoder?: GPUCommandEncoder) => {
+	const renderScene = async () => {
 		if (!gpuState) {
 			console.warn('gpuState is null');
 			return;
@@ -355,38 +342,37 @@
 		}
 
 		const now = Date.now();
-		if (now - updated > 100) {
+		if (now - updated > 500) {
 			requestAnimationFrame(() => renderScene());
 			return;
 		}
 
-		const {
-			root,
-			renderPipeline,
-			imageRenderPipeline,
-			cameraUniformBuffer,
-			pickTexture,
-			linearSampler,
-			context,
-			imageContext,
-			filteredTexture,
-			querySet,
-			imageBitmap
-		} = gpuState;
-		const _encoder = encoder ?? root.device.createCommandEncoder();
-		const blurredWeightTexture = gpuState.blurredWeightTexture;
+		const { root, linearSampler, context, imageContext, filteredTexture, blurredWeightTexture } =
+			gpuState;
 
 		const selectedColor = isHovering
 			? d.vec4f(hoveredRGB.x, hoveredRGB.y, hoveredRGB.z, 0.05)
 			: d.vec4f(0.0, 0.0, 0.0, 1000.0);
+		const colorOklab = srgb_to_oklab(selectedColor.xyz);
+		contrastRGB = colorOklab.x > 0.45 ? d.vec3f(0, 0, 0) : d.vec3f(1, 1, 1);
+
+		const fast = now - updated < 100 && now > startTime + 1000;
+		const renderSize = fast
+			? [colorCanvas.width >> 1, colorCanvas.height >> 1]
+			: [colorCanvas.width, colorCanvas.height];
+		const steps = fast ? 20 : 64;
+		const pickTexture = getTexture(gpuState.root, 'pickTexture', renderSize[0], renderSize[1]);
 
 		const pickView = (pickTexture as any).createView('render');
+		const cloudTexture = getTexture(root, 'cloudTexture', renderSize[0], renderSize[1]);
+		const cloudView = (cloudTexture as any).createView('render');
 		renderColorCloud(
 			root,
-			gpuState.blurredWeightTexture,
+			blurredWeightTexture,
 			linearSampler,
-			context,
+			cloudView,
 			pickView,
+			colorSpace,
 			{
 				textureSize,
 				saturation,
@@ -411,23 +397,18 @@
 			selectedColor
 		});
 
-		if (!encoder) {
-			root.device.queue.submit([_encoder.finish()]);
-		}
-		await root.device.queue.onSubmittedWorkDone();
+		renderImage(root, cloudTexture, linearSampler, context, {
+			textureSize,
+			saturation,
+			contrast,
+			selectedColor: d.vec4f(0.0, 0.0, 0.0, 1000.0)
+		});
 
-		// if (querySet.available) {
-		// 	querySet.resolve();
-		// 	const values = await querySet.read();
-		// 	for (let i = 0; i < 16; i += 2) {
-		// 		const start = values[i];
-		// 		const end = values[i + 1];
-		// 		const time = Number(end - start);
-		// 		console.log(`Pass ${i / 2}: ${time / 1e6} ms`);
-		// 	}
-		// } else {
-		// 	console.warn('querySet not available');
-		// }
+		await root.device.queue.onSubmittedWorkDone();
+		if (!fast) {
+			invalidateCaches();
+		}
+		readTimings();
 		requestAnimationFrame(() => renderScene());
 	};
 
@@ -456,13 +437,6 @@
 			const bitmap = await imageUrlToBitmap(beeCloseImg);
 			const texture = await bitmapToTexture(root, bitmap);
 
-			const pickTexture = root
-				.createTexture({
-					size: [colorCanvas.width, colorCanvas.height],
-					format: 'rgba8unorm'
-				})
-				.$usage('render', 'sampled');
-
 			const pickStagingBuffer = root
 				.createBuffer(d.arrayOf(d.u32, 64))
 				.$addFlags(GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
@@ -472,84 +446,26 @@
 				minFilter: 'linear'
 			});
 
-			const querySet = root.createQuerySet('timestamp', 16);
-
-			const renderPipeline = root
-				.createRenderPipeline({
-					primitive: { topology: 'triangle-list' },
-					vertex: quadVertex,
-					fragment: triangleFragment,
-					targets: {
-						color: { format: navigator.gpu.getPreferredCanvasFormat() },
-						pick: { format: 'rgba8unorm' }
-					}
-				})
-				.withTimestampWrites({
-					querySet,
-					beginningOfPassWriteIndex: 6,
-					endOfPassWriteIndex: 7
-				});
-
-			const imageRenderPipeline = root
-				.createRenderPipeline({
-					primitive: { topology: 'triangle-list' },
-					vertex: quadVertex,
-					fragment: imageFragment
-				})
-				.withTimestampWrites({
-					querySet,
-					beginningOfPassWriteIndex: 8,
-					endOfPassWriteIndex: 9
-				});
+			// const querySet = root.createQuerySet('timestamp', 16);
 
 			textureSize = d.vec2u(bitmap.width, bitmap.height);
 
-			const optionsBuffer = root.createBuffer(computeOptions).$usage('uniform');
-			optionsBuffer.write({ textureSize, tableSize });
-
-			const filterOptionsBuffer = root.createBuffer(filterOptions).$usage('uniform');
-			filterOptionsBuffer.write({
-				textureSize,
-				selectedColor: d.vec4f(0.0, 0.0, 0.0, 1000.0),
-				saturation: saturation,
-				contrast: contrast
-			});
-
-			const cameraUniformBuffer = root.createBuffer(cameraUniform).$usage('uniform');
-			cameraUniformBuffer.write({
-				yaw: 0.5,
-				pitch: 0.2,
-				radius: 2,
-				aspect: colorCanvas.width / colorCanvas.height,
-				steps,
-				sensitivity,
-				bgColor
-			});
-
 			gpuState = {
 				root,
-				renderPipeline,
-				imageRenderPipeline,
-				optionsBuffer,
-				cameraUniformBuffer,
-				filterOptionsBuffer,
 				context,
 				imageContext,
 				imageBitmap: bitmap,
 				imageTexture: texture,
-				pickTexture,
 				pickStagingBuffer,
 				linearSampler: sampler,
 				filteredTexture: texture,
-				querySet,
 				blurredWeightTexture: null
 			};
 
-			const encoder = root.device.createCommandEncoder();
-			computeWeightTexture(tableSize, encoder);
+			computeWeightTexture(tableSize);
 			updated = Date.now();
-			renderScene(encoder);
-			root.device.queue.submit([encoder.finish()]);
+			startTime = Date.now();
+			renderScene();
 		} catch (e) {
 			console.error('Failed to initialize WebGPU:', e);
 		}
@@ -577,82 +493,27 @@
 		tableSizeStr = v;
 		tableSize = parseInt(v);
 		if (gpuState) {
-			const encoder = gpuState.root.device.createCommandEncoder();
-
-			gpuState.optionsBuffer.write({
-				tableSize,
-				textureSize: d.vec2u(gpuState.imageBitmap.width, gpuState.imageBitmap.height)
-			});
 			invalidateCaches();
-			computeWeightTexture(tableSize, encoder);
+			computeWeightTexture(tableSize);
 			updated = Date.now();
-			gpuState.root.device.queue.submit([encoder.finish()]);
 		}
 	};
-
-	const applyFilters = () => {
-		if (!gpuState) return;
-		const root = gpuState.root;
-		const width = gpuState.imageBitmap.width;
-		const height = gpuState.imageBitmap.height;
-		const imageTexture = gpuState.imageTexture;
-
-		const { textures, outputViews, sampler } = once([applyFilters, width, height], () => {
-			const textures = [
-				root
-					.createTexture({
-						size: [width, height],
-						format: 'rgba16float'
-					})
-					.$usage('render', 'sampled', 'storage'),
-				root
-					.createTexture({
-						size: [width, height],
-						format: 'rgba16float'
-					})
-					.$usage('render', 'sampled', 'storage')
-			];
-
-			const outputViews = [textures[0].createView('render'), textures[1].createView('render')];
-
-			const sampler = root.createSampler({
-				magFilter: 'linear',
-				minFilter: 'linear'
-			});
-
-			return {
-				textures,
-				outputViews,
-				sampler
-			};
-		});
-
-		const outputTexture = filterTexture(root, imageTexture, sampler, {
-			textureSize: d.vec2u(width, height),
-			selectedColor: d.vec4f(0.0, 0.0, 0.0, 1000.0),
-			saturation: saturation,
-			contrast: contrast
-		});
-
-		gpuState.filteredTexture = outputTexture;
-		return outputTexture;
-	};
-	// const calculateWeights = () => {};
-	// const renderScene = () => {};
 </script>
 
 <svelte:head>
-	<title>Hello Triangle</title>
+	<title>Color Cloud</title>
 </svelte:head>
 
 <div class="page-container">
 	<header>
-		<h1>Hello World Triangle</h1>
+		<h1>Color Cloud</h1>
 		<p>A simple triangle rendered with TypeGPU</p>
 	</header>
 
 	<main>
 		<div class="canvases">
+			<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
 			<div
 				role="img"
 				class="canvas-container"
@@ -663,12 +524,18 @@
 						const px = (event.clientX - canvasRect.left) * (colorCanvas.width / canvasRect.width);
 						const py = (event.clientY - canvasRect.top) * (colorCanvas.height / canvasRect.height);
 						if (gpuState) {
-							const v = await readColorAtPixel(gpuState?.pickTexture, px, py);
+							const pickTexture = getTexture(
+								gpuState.root,
+								'pickTexture',
+								colorCanvas.width,
+								colorCanvas.height
+							);
+							const v = await readColorAtPixel(pickTexture, px, py);
 
 							if (v && v.a > 0) {
 								isHovering = true;
-								color = `rgba(${v.r} ${v.g} ${v.b} / ${v.a / 255})`;
 								hoveredRGB = d.vec3f(v.r / 255.0, v.g / 255.0, v.b / 255.0);
+								color = rgbToCssColor(hoveredRGB);
 								onUpdate();
 							} else if (isHovering && v) {
 								isHovering = false;
@@ -701,12 +568,20 @@
 					onUpdate();
 					invalidateCaches();
 				}}
+				onclick={() => {
+					if (isHovering) {
+						savedRGB = hoveredRGB;
+						onUpdate();
+					}
+				}}
 			>
 				<canvas bind:this={colorCanvas} width="800" height="600"></canvas>
 				{#if isHovering}
-					<div class="color-display" style="background-color: {color};"></div>
+					<div class="color-display absolute" style="background-color: {color};"></div>
 				{/if}
 			</div>
+			<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
 			<div
 				class="canvas-container"
 				role="img"
@@ -720,8 +595,8 @@
 					const v = await readColorAtPixel(gpuState.filteredTexture, px, py);
 
 					if (isHovering && v && v.a > 0) {
-						color = `rgba(${v.r} ${v.g} ${v.b} / ${v.a / 255})`;
 						hoveredRGB = d.vec3f(v.r / 255.0, v.g / 255.0, v.b / 255.0);
+						color = rgbToCssColor(hoveredRGB);
 						onUpdate();
 					} else if (isHovering && v) {
 						onUpdate();
@@ -735,28 +610,46 @@
 					isHovering = false;
 					onUpdate();
 				}}
+				onclick={() => {
+					if (isHovering) {
+						savedRGB = hoveredRGB;
+						onUpdate();
+					}
+				}}
 			>
 				<canvas bind:this={imageCanvas} width="800" height="600"></canvas>
 				{#if isHovering}
-					<div class="color-display" style="background-color: {color};"></div>
+					<div class="color-display absolute" style="background-color: {color};"></div>
 				{/if}
 			</div>
 		</div>
 
-		<div class="controls">
-			<label class="file-label">
-				<input type="file" accept="image/*" onchange={handleImageUpload} />
-				<span class="btn">📂 Load Image</span>
-			</label>
-			<div class="presets">
-				<span class="preset-label">Presets:</span>
-				{#each presets as preset}
-					<button class="btn preset-btn" onclick={() => loadPreset(preset)}>{preset.name}</button>
-				{/each}
+		<div class="flex justify-between">
+			<div>
+				<div
+					class="color-display relative"
+					style="background-color: {rgbToHexColor(
+						isHovering ? hoveredRGB : (savedRGB ?? d.vec3f(0, 0, 0))
+					)}; border-color: {rgbToHexColor(contrastRGB)}; color: {rgbToHexColor(contrastRGB)}"
+				>
+					{rgbToHexColor(isHovering ? hoveredRGB : (savedRGB ?? d.vec3f(0, 0, 0)))}
+				</div>
 			</div>
-			{#if imageName}
-				<span class="img-name">{imageName}</span>
-			{/if}
+			<div class="controls">
+				<label class="file-label">
+					<input type="file" accept="image/*" onchange={handleImageUpload} />
+					<span class="btn">📂 Load Image</span>
+				</label>
+				<div class="presets">
+					<span class="preset-label">Presets:</span>
+					{#each presets as preset}
+						<button class="btn preset-btn" onclick={() => loadPreset(preset)}>{preset.name}</button>
+					{/each}
+				</div>
+				{#if imageName}
+					<span class="img-name">{imageName}</span>
+				{/if}
+			</div>
 		</div>
 
 		<div class="mt-4 grid w-full max-w-[1000px] grid-cols-2 gap-12 px-4">
@@ -828,7 +721,7 @@
 					</div>
 				</div>
 
-				<div class="flex items-center gap-2">
+				<!-- <div class="flex items-center gap-2">
 					<span class="text-slate-200">Table Size:</span>
 					<Select.Root
 						type="single"
@@ -861,6 +754,65 @@
 										>
 											{#snippet children({ selected })}
 												{size.label}
+												{#if selected}
+													<div class="ml-auto">
+														<CheckIcon aria-label="check" class="size-4" />
+													</div>
+												{/if}
+											{/snippet}
+										</Select.Item>
+									{/each}
+								</Select.Viewport>
+								<Select.ScrollDownButton class="flex w-full items-center justify-center">
+									<CaretDoubleDownIcon class="size-3 text-slate-400" />
+								</Select.ScrollDownButton>
+							</Select.Content>
+						</Select.Portal>
+					</Select.Root>
+				</div> -->
+
+				<div class="flex items-center gap-2">
+					<span class="text-slate-200">Color Space:</span>
+					<Select.Root
+						type="single"
+						value={colorSpace}
+						onValueChange={(v) => {
+							colorSpace = v as ColorSpace;
+							if (gpuState) {
+								const encoder = gpuState.root.device.createCommandEncoder();
+								invalidateCaches();
+								computeWeightTexture(tableSize);
+								updated = Date.now();
+								gpuState.root.device.queue.submit([encoder.finish()]);
+							}
+						}}
+						items={colorSpaces}
+						allowDeselect={false}
+					>
+						<Select.Trigger
+							class="inline-flex h-10 w-[200px] touch-none items-center rounded-md border border-white/10 bg-slate-800 px-3 text-sm transition-colors select-none"
+							aria-label="Select a color space"
+						>
+							<Select.Value placeholder="Select a color space" />
+							<CaretUpDownIcon class="ml-auto size-5 text-slate-400" />
+						</Select.Trigger>
+						<Select.Portal>
+							<Select.Content
+								class="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-[state=closed]:animate-out data-[state=open]:animate-in z-50 h-auto max-h-96 w-[var(--bits-select-anchor-width)] min-w-[var(--bits-select-anchor-width)] rounded-xl border border-slate-700 bg-slate-800 px-1 py-1 shadow-md outline-hidden select-none"
+								sideOffset={10}
+							>
+								<Select.ScrollUpButton class="flex w-full items-center justify-center">
+									<CaretDoubleUpIcon class="size-3 text-slate-400" />
+								</Select.ScrollUpButton>
+								<Select.Viewport class="p-1">
+									{#each colorSpaces as space, i (i + space.value)}
+										<Select.Item
+											class="flex h-9 w-full cursor-pointer items-center rounded-md py-2 pr-1.5 pl-3 text-sm text-white outline-hidden select-none data-highlighted:bg-blue-600"
+											value={space.value}
+											label={space.label}
+										>
+											{#snippet children({ selected })}
+												{space.label}
 												{#if selected}
 													<div class="ml-auto">
 														<CheckIcon aria-label="check" class="size-4" />
@@ -972,7 +924,7 @@
 	}
 
 	header {
-		text-align: center;
+		text-align: left;
 		margin-bottom: 2rem;
 	}
 
@@ -1008,15 +960,18 @@
 	}
 
 	.color-display {
-		position: absolute;
 		top: 1rem;
 		right: 1rem;
-		width: 40px;
+		min-width: 40px;
 		height: 40px;
 		border-radius: 8px;
 		background-color: #000;
 		box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
 		border: 2px solid rgba(255, 255, 255, 0.8);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 8px 12px 8px 12px;
 	}
 
 	canvas {
@@ -1025,7 +980,7 @@
 		background-color: #000;
 		width: 100%;
 		max-width: 800px;
-		height: auto;
+		height: 300px;
 		aspect-ratio: 4/3;
 	}
 
