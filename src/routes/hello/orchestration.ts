@@ -1,6 +1,6 @@
 import { d, type StorageFlag, type TgpuBuffer, type TgpuFixedSampler, type TgpuQuerySet, type TgpuRenderPipeline, type TgpuRoot, type TgpuTexture } from "typegpu";
 import { once, onceBindGroup } from "./gpu_utils";
-import { computeOptions, filterBindLayout, filterFragment, filterOptions, quadVertex, textureRenderLayout, weightCalculation, weightCalculationLayout, processWeights, weightTransferLayout, weightTextureFormat, blur, weightProcessingLayout, imageFragment, triangleFragment, cameraBindLayout, cameraUniform, colorSpaceSlot, linearRgbColorSpace, srgbColorSpace, oklabColorSpace, colorSpaceInverseSlot, linearRgbColorSpaceInverse, srgbColorSpaceInverse, oklabColorSpaceInverse } from "./shaders";
+import { computeOptions, filterBindLayout, filterFragment, filterOptions, quadVertex, textureRenderLayout, weightCalculation, weightCalculationLayout, processWeights, weightTransferLayout, weightTextureFormat, blur, weightProcessingLayout, imageFragment, triangleFragment, cameraBindLayout, cameraUniform, colorSpaceSlot, linearRgbColorSpace, srgbColorSpace, oklabColorSpace, colorSpaceInverseSlot, linearRgbColorSpaceInverse, srgbColorSpaceInverse, oklabColorSpaceInverse, hsvColorSpace, hsvColorSpaceInverse, hslColorSpace, hslColorSpaceInverse } from "./shaders";
 import { textureDimensions } from "typegpu/std";
 import { ColorSpace } from "./color_utils";
 
@@ -106,7 +106,7 @@ export const calculateWeights = (root: TgpuRoot, inputTexture: TgpuTexture, colo
         optionsBuffer,
     } = once([calculateWeights, colorSpace], () => {
         const pipeline = root
-            .with(colorSpaceSlot, colorSpaceMap[colorSpace])
+            .with(colorSpaceSlot, colorSpacesConfig[colorSpace].forward)
             .createGuardedComputePipeline(weightCalculation)
             .withTimestampWrites(timestampOptions(root, 'calculateWeights'))
         const optionsBuffer = root.createBuffer(computeOptions).$usage('uniform');
@@ -242,17 +242,13 @@ export const renderImage = (root: TgpuRoot, inputTexture: TgpuTexture, inputSamp
 
 
 
-const colorSpaceMap = {
-    [ColorSpace.srgb]: srgbColorSpace,
-    [ColorSpace.linear_rgb]: linearRgbColorSpace,
-    [ColorSpace.oklab]: oklabColorSpace,
-}
-
-const colorSpaceInverseMap = {
-    [ColorSpace.srgb]: srgbColorSpaceInverse,
-    [ColorSpace.linear_rgb]: linearRgbColorSpaceInverse,
-    [ColorSpace.oklab]: oklabColorSpaceInverse,
-}
+export const colorSpacesConfig = {
+    [ColorSpace.oklab]: { label: 'Oklab', forward: oklabColorSpace, inverse: oklabColorSpaceInverse },
+    [ColorSpace.hsv]: { label: 'HSV', forward: hsvColorSpace, inverse: hsvColorSpaceInverse },
+    [ColorSpace.hsl]: { label: 'HSL', forward: hslColorSpace, inverse: hslColorSpaceInverse },
+    [ColorSpace.srgb]: { label: 'sRGB', forward: srgbColorSpace, inverse: srgbColorSpaceInverse },
+    [ColorSpace.linear_rgb]: { label: 'Linear RGB', forward: linearRgbColorSpace, inverse: linearRgbColorSpaceInverse },
+};
 
 export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inputSampler: TgpuFixedSampler, outputView: any, pickView: any, colorSpace: ColorSpace, options: d.Infer<typeof filterOptions>, camera: d.Infer<typeof cameraUniform>) => {
     const {
@@ -261,8 +257,8 @@ export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inpu
         cameraBuffer
     } = once([renderColorCloud, colorSpace], () => {
         const pipeline = root
-            .with(colorSpaceSlot, colorSpaceMap[colorSpace])
-            .with(colorSpaceInverseSlot, colorSpaceInverseMap[colorSpace])
+            .with(colorSpaceSlot, colorSpacesConfig[colorSpace].forward)
+            .with(colorSpaceInverseSlot, colorSpacesConfig[colorSpace].inverse)
             .createRenderPipeline({
                 primitive: { topology: 'triangle-list' },
                 vertex: quadVertex,

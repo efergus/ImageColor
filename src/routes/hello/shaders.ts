@@ -1,6 +1,6 @@
 import tgpu, { d, std } from 'typegpu';
 import { textureSample, textureLoad, textureSampleLevel, textureDimensions } from 'typegpu/std';
-import { ColorSpace, linear_rgb_to_oklab, linear_rgb_to_srgb, oklab_to_linear_rgb, oklab_to_srgb, srgb_to_linear_rgb, srgb_to_oklab } from './color_utils';
+import { ColorSpace, hsl_to_srgb, hsv_to_srgb, linear_rgb_to_oklab, linear_rgb_to_srgb, oklab_to_linear_rgb, oklab_to_srgb, srgb_to_hsl, srgb_to_hsv, srgb_to_linear_rgb, srgb_to_oklab } from './color_utils';
 import { randf } from '@typegpu/noise';
 
 const rotX = (pitch: number) => {
@@ -121,6 +121,82 @@ export const oklabColorSpaceInverse = (color: d.v3f) => {
 	const raw = d.vec3f(color.y, color.x - 0.5, color.z - 0.5);
 	const transformed = oklab_to_srgb(raw);
 	return transformed;
+}
+
+export const hsvColorSpace = (color: d.v3f) => {
+	'use gpu';
+	const raw = srgb_to_hsv(color);
+	const theta = std.mul(d.f32(raw.x), d.f32(Math.PI / 180.0));
+	
+	// In HSV, the color space is a single cone.
+	// Radius depends on both Saturation (raw.y) and Value (raw.z).
+	// Value maps directly to the Y axis.
+	return d.vec3f(
+		std.cos(theta) * raw.y * raw.z * 0.5 + 0.5,
+		raw.z,
+		std.sin(theta) * raw.y * raw.z * 0.5 + 0.5
+	);
+}
+
+export const hsvColorSpaceInverse = (color: d.v3f) => {
+	'use gpu';
+	const cx = (color.x - 0.5) * 2.0;
+	const cz = (color.z - 0.5) * 2.0;
+	
+	const theta = std.atan2(cz, cx);
+	let hue = theta * d.f32(180.0 / Math.PI);
+	if (hue < d.f32(0.0)) {
+		hue = hue + 360.0;
+	}
+	
+	const value = color.y;
+	const radius = std.length(d.vec2f(cx, cz));
+	
+	let saturation = d.f32(0.0);
+	if (value > d.f32(0.0)) {
+		saturation = std.min(radius / value, d.f32(1.0));
+	}
+	
+	return hsv_to_srgb(d.vec3f(hue, saturation, value));
+}
+
+export const hslColorSpace = (color: d.v3f) => {
+	'use gpu';
+	const raw = srgb_to_hsl(color);
+	const theta = std.mul(d.f32(raw.x), d.f32(Math.PI / 180.0));
+	
+	// In HSL, radius (chroma) goes to 0 at both ends of the Lightness axis.
+	const chroma = std.mul(raw.y, std.sub(d.f32(1.0), std.abs(std.sub(std.mul(raw.z, d.f32(2.0)), d.f32(1.0)))));
+	const radius = std.mul(chroma, d.f32(0.5)); // Scale to max radius 0.5
+	
+	return d.vec3f(
+		std.cos(theta) * radius + 0.5,
+		raw.z, // Lightness maps directly to the Y axis
+		std.sin(theta) * radius + 0.5
+	);
+}
+
+export const hslColorSpaceInverse = (color: d.v3f) => {
+	'use gpu';
+	const cx = (color.x - 0.5) * 2.0;
+	const cz = (color.z - 0.5) * 2.0;
+	
+	const theta = std.atan2(cz, cx);
+	let hue = theta * d.f32(180.0 / Math.PI);
+	if (hue < d.f32(0.0)) {
+		hue = hue + 360.0;
+	}
+	
+	const lightness = color.y;
+	const radius = std.length(d.vec2f(cx, cz)); // This is actually half the chroma
+	
+	const maxChroma = std.sub(d.f32(1.0), std.abs(std.sub(std.mul(lightness, d.f32(2.0)), d.f32(1.0))));
+	let saturation = d.f32(0.0);
+	if (maxChroma > d.f32(0.0)) {
+		saturation = std.min(radius / maxChroma, d.f32(1.0)); // Because maxChroma here is already equivalent to max radius
+	}
+	
+	return hsl_to_srgb(d.vec3f(hue, saturation, lightness));
 }
 
 export const weightCalculation = (x: number, y: number) => {

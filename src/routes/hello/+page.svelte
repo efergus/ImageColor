@@ -49,16 +49,16 @@
 		blurWeightTexture,
 		renderImage,
 		renderColorCloud,
-		readTimings
+		readTimings,
+		colorSpacesConfig
 	} from './orchestration';
 	import { once } from './gpu_utils';
 	import { ColorSpace, oklab_to_srgb, srgb_to_oklab } from './color_utils';
 
-	const colorSpaces = [
-		{ value: ColorSpace.srgb, label: 'sRGB' },
-		{ value: ColorSpace.linear_rgb, label: 'Linear RGB' },
-		{ value: ColorSpace.oklab, label: 'Oklab' }
-	];
+	const colorSpaces = Object.entries(colorSpacesConfig).map(([value, config]) => ({
+		value: value as ColorSpace,
+		label: config.label
+	}));
 
 	let colorCanvas: HTMLCanvasElement;
 	let imageCanvas: HTMLCanvasElement;
@@ -637,7 +637,7 @@
 			</div>
 			<div class="controls">
 				<label class="file-label">
-					<input type="file" accept="image/*" onchange={handleImageUpload} />
+					<input type="file" accept="image/*,image/png" onchange={handleImageUpload} />
 					<span class="btn">📂 Load Image</span>
 				</label>
 				<div class="presets">
@@ -858,7 +858,12 @@
 							<span
 								class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20"
 							>
-								<Slider.Range class="absolute h-full bg-blue-600" />
+								<div
+									class="absolute h-full bg-blue-600"
+									style="left: {Math.min(saturation, 1.0) * 50}%; right: {(2.0 -
+										Math.max(saturation, 1.0)) *
+										50}%;"
+								></div>
 							</span>
 							<Slider.Thumb
 								index={0}
@@ -889,7 +894,12 @@
 							<span
 								class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20"
 							>
-								<Slider.Range class="absolute h-full bg-blue-600" />
+								<div
+									class="absolute h-full bg-blue-600"
+									style="left: {Math.min(contrast, 1.0) * 50}%; right: {(2.0 -
+										Math.max(contrast, 1.0)) *
+										50}%;"
+								></div>
 							</span>
 							<Slider.Thumb
 								index={0}

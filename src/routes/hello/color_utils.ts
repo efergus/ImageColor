@@ -3,7 +3,9 @@ import tgpu, { d, std } from 'typegpu';
 export enum ColorSpace {
     srgb = 'srgb',
     linear_rgb = 'linear_rgb',
-    oklab = 'oklab'
+    oklab = 'oklab',
+    hsv = 'hsv',
+    hsl = 'hsl'
 };
 
 export const srgb_to_linear_rgb = (color: d.v3f) => {
@@ -60,4 +62,155 @@ export const srgb_to_oklab = (color: d.v3f) => {
 export const oklab_to_srgb = (color: d.v3f) => {
     'use gpu';
     return linear_rgb_to_srgb(oklab_to_linear_rgb(color));
+}
+
+export const srgb_to_hsv = (color: d.v3f) => {
+    'use gpu';
+    // Converts a standard RGB color to HSV (Hue, Saturation, Value) space.
+    // Hue is calculated in degrees [0, 360). Saturation and Value are in [0, 1].
+    // This color space is mapped as a single cone where Value is the vertical axis.
+    const r = color.r;
+    const g = color.g;
+    const b = color.b;
+    const max = std.max(r, std.max(g, b));
+    const min = std.min(r, std.min(g, b));
+    const delta = std.sub(max, min);
+    let h = d.f32(0);
+    let s = d.f32(0);
+    let v = d.f32(0);
+    if (delta === d.f32(0)) {
+        h = d.f32(0);
+        s = d.f32(0);
+        v = max;
+    } else {
+        if (max === r) {
+            h = std.div(std.sub(g, b), delta);
+        } else if (max === g) {
+            h = std.add(std.div(std.sub(b, r), delta), d.f32(2.0));
+        } else {
+            h = std.add(std.div(std.sub(r, g), delta), d.f32(4.0));
+        }
+        h = std.mod(std.add(h, d.f32(6.0)), d.f32(6.0));
+        h = std.mul(h, d.f32(60.0));
+        s = std.div(delta, max);
+        v = max;
+    }
+    return d.vec3f(h, s, v);
+}
+
+export const hsv_to_srgb = (color: d.v3f) => {
+    'use gpu';
+    // Converts an HSV color back to the standard RGB color space.
+    // Reverses the single cone mapping to return RGB components in [0, 1].
+    const h = color.r;
+    const s = color.g;
+    const v = color.b;
+    const i = std.floor(std.mul(std.div(h, d.f32(60.0)), d.f32(1.0)));
+    const f = std.sub(std.div(h, d.f32(60.0)), i);
+    const p = std.sub(v, std.mul(v, std.mul(s, d.f32(1.0))));
+    const q = std.sub(v, std.mul(v, std.mul(s, std.mul(f, d.f32(1.0)))));
+    const t = std.sub(v, std.mul(v, std.mul(s, std.sub(d.f32(1.0), f))));
+    let r = d.f32(0);
+    let g = d.f32(0);
+    let b = d.f32(0);
+    if (i === d.f32(0)) {
+        r = v;
+        g = t;
+        b = p;
+    } else if (i === d.f32(1)) {
+        r = q;
+        g = v;
+        b = p;
+    } else if (i === d.f32(2)) {
+        r = p;
+        g = v;
+        b = t;
+    } else if (i === d.f32(3)) {
+        r = p;
+        g = q;
+        b = v;
+    } else if (i === d.f32(4)) {
+        r = t;
+        g = p;
+        b = v;
+    } else {
+        r = v;
+        g = p;
+        b = q;
+    }
+    return d.vec3f(r, g, b);
+}
+
+export const srgb_to_hsl = (color: d.v3f) => {
+    'use gpu';
+    // Converts a standard RGB color to HSL (Hue, Saturation, Lightness) space.
+    // Hue is calculated in degrees [0, 360). Saturation and Lightness are in [0, 1].
+    // This color space is typically mapped as a double hexcone.
+    const r = color.r;
+    const g = color.g;
+    const b = color.b;
+    const max = std.max(r, std.max(g, b));
+    const min = std.min(r, std.min(g, b));
+    const delta = std.sub(max, min);
+    
+    let h = d.f32(0);
+    let s = d.f32(0);
+    const l = std.div(std.add(max, min), d.f32(2.0));
+    
+    if (delta === d.f32(0)) {
+        h = d.f32(0);
+        s = d.f32(0);
+    } else {
+        if (max === r) {
+            h = std.div(std.sub(g, b), delta);
+        } else if (max === g) {
+            h = std.add(std.div(std.sub(b, r), delta), d.f32(2.0));
+        } else {
+            h = std.add(std.div(std.sub(r, g), delta), d.f32(4.0));
+        }
+        h = std.mod(std.add(h, d.f32(6.0)), d.f32(6.0));
+        h = std.mul(h, d.f32(60.0));
+        
+        // Saturation calculation for HSL
+        const l_step = std.abs(std.sub(std.mul(l, d.f32(2.0)), d.f32(1.0)));
+        s = std.div(delta, std.sub(d.f32(1.0), l_step));
+    }
+    return d.vec3f(h, s, l);
+}
+
+export const hsl_to_srgb = (color: d.v3f) => {
+    'use gpu';
+    // Converts an HSL color back to the standard RGB color space.
+    // Reverses the double hexcone mapping to return RGB components in [0, 1].
+    const h = color.r;
+    const s = color.g;
+    const l = color.b;
+    
+    const l_step = std.abs(std.sub(std.mul(l, d.f32(2.0)), d.f32(1.0)));
+    const c = std.mul(std.sub(d.f32(1.0), l_step), s);
+    const h_prime = std.div(h, d.f32(60.0));
+    const x = std.mul(c, std.sub(d.f32(1.0), std.abs(std.sub(std.mod(h_prime, d.f32(2.0)), d.f32(1.0)))));
+    const m = std.sub(l, std.div(c, d.f32(2.0)));
+    
+    let r = d.f32(0);
+    let g = d.f32(0);
+    let b = d.f32(0);
+    
+    const i = std.floor(h_prime);
+    
+    if (i === d.f32(0)) {
+        r = c; g = x; b = d.f32(0);
+    } else if (i === d.f32(1)) {
+        r = x; g = c; b = d.f32(0);
+    } else if (i === d.f32(2)) {
+        r = d.f32(0); g = c; b = x;
+    } else if (i === d.f32(3)) {
+        r = d.f32(0); g = x; b = c;
+    } else if (i === d.f32(4)) {
+        r = x; g = d.f32(0); b = c;
+    } else {
+        r = c; g = d.f32(0); b = x;
+    }
+    
+    return d.vec3f(std.add(r, m), std.add(g, m), std.add(b, m));
 }
