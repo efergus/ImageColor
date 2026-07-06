@@ -1,5 +1,5 @@
 import { d, type StorageFlag, type TgpuBuffer, type TgpuFixedSampler, type TgpuQuerySet, type TgpuRenderPipeline, type TgpuRoot, type TgpuTexture } from "typegpu";
-import { once, onceBindGroup } from "./gpu_utils";
+import { once, onceBindGroup } from "../../lib/gpu/gpu_utils";
 import { computeOptions, filterBindLayout, filterFragment, filterOptions, quadVertex, textureRenderLayout, weightCalculation, weightCalculationLayout, processWeights, weightTransferLayout, weightTextureFormat, blur, weightProcessingLayout, imageFragment, triangleFragment, cameraBindLayout, cameraUniform, colorSpaceSlot, linearRgbColorSpace, srgbColorSpace, oklabColorSpace, colorSpaceInverseSlot, linearRgbColorSpaceInverse, srgbColorSpaceInverse, oklabColorSpaceInverse, hsvColorSpace, hsvColorSpaceInverse, hslColorSpace, hslColorSpaceInverse } from "./shaders";
 import { textureDimensions } from "typegpu/std";
 import { ColorSpace } from "./color_utils";

@@ -1,4 +1,4 @@
-import { onceObjEntries, type ObjMap } from './gpu_utils';
+import { onceObjEntries, type ObjMap } from '../../lib/gpu/gpu_utils';
 import { expect, test } from "vitest";
 
 test('gpu_utils.onceObjEntries', () => {
