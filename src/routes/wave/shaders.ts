@@ -1,6 +1,7 @@
 
 import tgpu, { d, std, type StorageFlag, type TgpuBuffer, type TgpuBufferReadonly, type TgpuRoot } from 'typegpu';
 import { once, onceBindGroup } from "$lib/gpu/gpu_utils";
+import { quadVertex } from "../hello/shaders";
 
 const array2dSize = d.struct({
     width: d.u32,
@@ -21,6 +22,7 @@ export const waveFunctionLayout = tgpu.bindGroupLayout({
 });
 
 export const arrayIndex = (x: number, y: number, width: number) => {
+    'use gpu';
     return x + y * width;
 }
 
@@ -40,9 +42,8 @@ export const applyWaveFunction = (x: number, y: number) => {
     const curr = waveFunctionLayout.$.currX;
     const prev = waveFunctionLayout.$.prevX;
 
-    // 
     const updated = 2 * curr[idx] - prev[idx] + speed * speed * deltat * deltat * (
-        curr[left] + curr[right] + curr[up] + curr[down] - 4 * prev[idx]
+        curr[left] + curr[right] + curr[up] + curr[down] - 4 * curr[idx]
     );
 
     waveFunctionLayout.$.nextX[idx] = updated;
@@ -109,4 +110,61 @@ export const gpuWaveFunction = (root: TgpuRoot, prevX: GPUArray, currX: GPUArray
     });
 
     pipeline.with(bindGroup).dispatchWorkgroups(Math.ceil(options.width / 8), Math.ceil(options.height / 8));
+}
+
+export const waveRenderLayout = tgpu.bindGroupLayout({
+    size: { uniform: array2dSize },
+    field: { storage: scalarArray, access: 'readonly' },
+});
+
+export const waveFragmentOutput = d.struct({
+    color: d.vec4f,
+});
+
+export const waveFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof waveFragmentOutput> => {
+    'use gpu';
+    const width = waveRenderLayout.$.size.width;
+    const height = waveRenderLayout.$.size.height;
+    const x = std.min(d.u32(uv.x * d.f32(width)), width - 1);
+    const y = std.min(d.u32(uv.y * d.f32(height)), height - 1);
+    const value = waveRenderLayout.$.field[arrayIndex(x, y, width)];
+    const brightness = std.clamp(0.5 + 0.5 * value, 0.0, 1.0);
+    return {
+        color: d.vec4f(brightness, brightness, brightness, 1.0)
+    };
+}
+
+export const renderWave = (root: TgpuRoot, field: GPUArray, outputView: any, options: {
+    width: number,
+    height: number
+}) => {
+    const {
+        pipeline,
+        sizeUniform
+    } = once(renderWave, () => {
+        const pipeline = root.createRenderPipeline({
+            primitive: { topology: 'triangle-list' },
+            vertex: quadVertex,
+            fragment: waveFragment,
+            targets: {
+                color: { format: navigator.gpu.getPreferredCanvasFormat() }
+            }
+        });
+        const sizeUniform = root.createBuffer(array2dSize).$usage('uniform');
+        return { pipeline, sizeUniform };
+    });
+
+    const bindGroup = onceBindGroup(root, waveRenderLayout, {
+        size: sizeUniform,
+        field
+    });
+
+    sizeUniform.write({
+        width: options.width,
+        height: options.height
+    });
+
+    pipeline.with(bindGroup).withColorAttachment({
+        color: { view: outputView }
+    }).draw(6);
 }

@@ -52,7 +52,7 @@
 		readTimings,
 		colorSpacesConfig
 	} from './orchestration';
-	import { once } from './gpu_utils';
+	import { once } from '$lib/gpu/gpu_utils';
 	import { ColorSpace, oklab_to_srgb, srgb_to_oklab } from './color_utils';
 
 	const colorSpaces = Object.entries(colorSpacesConfig).map(([value, config]) => ({
