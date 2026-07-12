@@ -1,7 +1,7 @@
 
 import tgpu, { d, std, type StorageFlag, type TgpuBuffer, type TgpuBufferReadonly, type TgpuRoot } from 'typegpu';
 import { once, onceBindGroup } from "$lib/gpu/gpu_utils";
-import { quadVertex } from "../hello/shaders";
+import { quadVertex } from "../color/shaders";
 
 const array2dSize = d.struct({
     width: d.u32,
