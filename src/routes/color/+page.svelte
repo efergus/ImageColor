@@ -49,6 +49,7 @@
 		blurWeightTexture,
 		renderImage,
 		renderColorCloud,
+		compositeColorCloud,
 		readTimings,
 		colorSpacesConfig
 	} from './orchestration';
@@ -65,6 +66,9 @@
 	let updated = $state(0.0);
 	let filterUpdated = $state(0.0);
 	let filterCalculated = $state(0.0);
+	let cloudUpdated = $state(0.0);
+	let cloudRendered = $state(0.0);
+	let cloudRenderedFast = $state(false);
 	let yaw = $state(0.4);
 	let pitch = $state(0.2);
 	let radius = $state(1);
@@ -245,7 +249,7 @@
 			invalidateCaches();
 			const encoder = gpuState.root.device.createCommandEncoder();
 			computeWeightTexture(tableSize);
-			updated = Date.now();
+			onCloudUpdate();
 			gpuState.root.device.queue.submit([encoder.finish()]);
 		} catch (e) {
 			console.error('Failed to load new image', e);
@@ -356,39 +360,29 @@
 		const colorOklab = srgb_to_oklab(selectedColor.xyz);
 		contrastRGB = colorOklab.x > 0.45 ? d.vec3f(0, 0, 0) : d.vec3f(1, 1, 1);
 
-		const fast = now - updated < 100 && now > startTime + 1000;
+		const fast = now - cloudUpdated < 100 && now > startTime + 1000;
 		const renderSize = fast
 			? [colorCanvas.width >> 1, colorCanvas.height >> 1]
 			: [colorCanvas.width, colorCanvas.height];
-		const steps = fast ? 20 : 64;
-		const pickTexture = getTexture(gpuState.root, 'pickTexture', renderSize[0], renderSize[1]);
-
-		const pickView = (pickTexture as any).createView('render');
+		const pickTexture = getTexture(root, 'pickTexture', renderSize[0], renderSize[1]);
 		const cloudTexture = getTexture(root, 'cloudTexture', renderSize[0], renderSize[1]);
-		const cloudView = (cloudTexture as any).createView('render');
-		renderColorCloud(
-			root,
-			blurredWeightTexture,
-			linearSampler,
-			cloudView,
-			pickView,
-			colorSpace,
-			{
-				textureSize,
-				saturation,
-				contrast,
-				selectedColor
-			},
-			{
+
+		const cloudDirty = cloudUpdated > cloudRendered || fast !== cloudRenderedFast;
+		if (cloudDirty) {
+			const steps = fast ? 20 : 64;
+			const pickView = (pickTexture as any).createView('render');
+			const cloudView = (cloudTexture as any).createView('render');
+			renderColorCloud(root, blurredWeightTexture, linearSampler, cloudView, pickView, colorSpace, {
 				yaw,
 				pitch,
 				radius,
 				aspect: colorCanvas.width / colorCanvas.height,
 				steps,
-				sensitivity,
-				bgColor
-			}
-		);
+				sensitivity
+			});
+			cloudRendered = now;
+			cloudRenderedFast = fast;
+		}
 
 		renderImage(root, filteredTexture, linearSampler, imageContext, {
 			textureSize,
@@ -397,15 +391,13 @@
 			selectedColor
 		});
 
-		renderImage(root, cloudTexture, linearSampler, context, {
-			textureSize,
-			saturation,
-			contrast,
-			selectedColor: d.vec4f(0.0, 0.0, 0.0, 1000.0)
+		compositeColorCloud(root, cloudTexture, pickTexture, linearSampler, context, {
+			selectedColor,
+			bgColor
 		});
 
 		await root.device.queue.onSubmittedWorkDone();
-		if (!fast) {
+		if (!fast && cloudDirty) {
 			invalidateCaches();
 		}
 		readTimings();
@@ -463,7 +455,7 @@
 			};
 
 			computeWeightTexture(tableSize);
-			updated = Date.now();
+			onCloudUpdate();
 			startTime = Date.now();
 			renderScene();
 		} catch (e) {
@@ -483,9 +475,16 @@
 		updated = Date.now();
 	};
 
+	const onCloudUpdate = () => {
+		const now = Date.now();
+		cloudUpdated = now;
+		updated = now;
+	};
+
 	const onFilterUpdate = () => {
 		const now = Date.now();
 		filterUpdated = now;
+		cloudUpdated = now;
 		updated = now;
 	};
 
@@ -495,7 +494,7 @@
 		if (gpuState) {
 			invalidateCaches();
 			computeWeightTexture(tableSize);
-			updated = Date.now();
+			onCloudUpdate();
 		}
 	};
 </script>
@@ -550,7 +549,7 @@
 
 					yaw -= deltaX / 100;
 					pitch += deltaY / 100;
-					updated = Date.now();
+					onCloudUpdate();
 					invalidateCaches();
 				}}
 				onmouseenter={() => {
@@ -565,7 +564,7 @@
 					event.preventDefault();
 					radius += event.deltaY * 0.005;
 					radius = Math.max(0.5, Math.min(3.0, radius));
-					onUpdate();
+					onCloudUpdate();
 					invalidateCaches();
 				}}
 				onclick={() => {
@@ -673,7 +672,7 @@
 							class="relative flex w-full touch-none items-center select-none"
 							onValueChange={(v) => {
 								sensitivitySlider = v;
-								onUpdate();
+								onCloudUpdate();
 								invalidateCaches();
 							}}
 						>
@@ -705,7 +704,6 @@
 							onValueChange={(v) => {
 								bgColor = v;
 								onUpdate();
-								invalidateCaches();
 							}}
 						>
 							<span
@@ -782,7 +780,7 @@
 								const encoder = gpuState.root.device.createCommandEncoder();
 								invalidateCaches();
 								computeWeightTexture(tableSize);
-								updated = Date.now();
+								onCloudUpdate();
 								gpuState.root.device.queue.submit([encoder.finish()]);
 							}
 						}}

@@ -321,12 +321,10 @@ export const cameraUniform = d.struct({
 	aspect: d.f32,
 	steps: d.u32,
 	sensitivity: d.f32,
-	bgColor: d.f32,
 });
 
 export const cameraBindLayout = tgpu.bindGroupLayout({
 	cameraUniform: { uniform: cameraUniform },
-	options: { uniform: filterOptions },
 	weightTexture: { texture: d.texture3d() },
 	weightSampler: { sampler: 'filtering' },
 });
@@ -375,9 +373,6 @@ export const triangleFragmentOutput = d.struct({
 export const triangleFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof triangleFragmentOutput> => {
 	'use gpu';
 
-	const bgLightness = cameraBindLayout.$.cameraUniform.bgColor;
-	const bg = d.vec4f(bgLightness, bgLightness, bgLightness, 1.0);
-
 	const center = d.vec3f(0.5, 0.5, 0.5);
 	const ray = cameraRay(
 		uv,
@@ -396,7 +391,7 @@ export const triangleFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof triangle
 	const max = intersection.y;
 	if (min >= max) {
 		return {
-			color: bg,
+			color: d.vec4f(0.0, 0.0, 0.0, 0.0),
 			pick: d.vec4f(0.0, 0.0, 0.0, 0.0),
 		};
 	}
@@ -408,23 +403,17 @@ export const triangleFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof triangle
 	let acc = d.vec4f(0.0, 0.0, 0.0, 0.0);
 	const sensitivity = cameraBindLayout.$.cameraUniform.sensitivity;
 	const wRange = std.max(sensitivity, d.f32(0.0001));
-	const targetColorSpaceColor = colorSpaceSlot.$(cameraBindLayout.$.options.selectedColor.rgb);
-	const targetDistance = cameraBindLayout.$.options.selectedColor.a;
 
 	for (let i = 0; i < steps; i++) {
 		const currentPoint = std.add(start, std.mul(direction, std.mul(stepSize, d.f32(i))));
 		const clampedPoint = std.clamp(currentPoint, d.vec3f(0.0, 0.0, 0.0), d.vec3f(1.0, 1.0, 1.0));
-		let keep = d.f32(std.allEq(currentPoint, clampedPoint));
+		const keep = d.f32(std.allEq(currentPoint, clampedPoint));
 		const sample = textureSampleLevel(cameraBindLayout.$.weightTexture, cameraBindLayout.$.weightSampler, clampedPoint, 0);
 
 		// This does not seem to have an effect
 		// if (sample.a <= 0.0) {
 		// 	continue;
 		// }
-
-		const outside = std.distance(targetColorSpaceColor, sample.rgb) < targetDistance;
-		keep = std.mul(keep, std.max(0.3, d.f32(outside)));
-
 
 		const oklabColor = sample.rgb;
 		const remapped = sample.a / wRange;
@@ -442,12 +431,41 @@ export const triangleFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof triangle
 	const keepPick = d.f32(acc.w > 0.0);
 	const pureColorSpaceColor = std.div(acc.xyz, std.max(d.f32(0.0001), acc.w));
 	const pureColor = colorSpaceInverseSlot.$(pureColorSpaceColor);
-	const colorRgb = std.add(std.mul(pureColor, acc.w), std.mul(bg.xyz, std.sub(d.f32(1.0), acc.w)));
 
 	return {
-		color: d.vec4f(colorRgb, 1.0),
+		color: std.mul(d.vec4f(pureColor, acc.w), keepPick),
 		pick: std.mul(d.vec4f(pureColor, 1.0), keepPick),
 	};
+};
+
+export const cloudCompositeOptions = d.struct({
+	selectedColor: d.vec4f,
+	bgColor: d.f32,
+});
+
+export const cloudCompositeLayout = tgpu.bindGroupLayout({
+	cloudTexture: { texture: d.texture2d() },
+	pickTexture: { texture: d.texture2d() },
+	sampler: { sampler: 'filtering' },
+	options: { uniform: cloudCompositeOptions }
+});
+
+export const cloudCompositeFragment = ({ uv }: { uv: d.v2f }) => {
+	'use gpu';
+	const cloud = textureSample(cloudCompositeLayout.$.cloudTexture, cloudCompositeLayout.$.sampler, uv);
+	const pick = textureSample(cloudCompositeLayout.$.pickTexture, cloudCompositeLayout.$.sampler, uv);
+
+	const targetDistance = cloudCompositeLayout.$.options.selectedColor.a;
+	const targetColorOklab = srgb_to_oklab(cloudCompositeLayout.$.options.selectedColor.rgb);
+	const pickOklab = srgb_to_oklab(pick.rgb);
+
+	const fade = std.clamp((std.distance(targetColorOklab, pickOklab) - targetDistance) * 100.0, 0.0, 0.7);
+	const alpha = cloud.a * (1.0 - fade);
+
+	const bgLightness = cloudCompositeLayout.$.options.bgColor;
+	const bg = d.vec3f(bgLightness, bgLightness, bgLightness);
+	const outColor = std.mix(bg, cloud.rgb, d.f32(alpha));
+	return d.vec4f(outColor, 1.0);
 };
 
 export const filterSlot = tgpu.slot<(uv: d.v2f, color: d.v4f) => d.v4f>();

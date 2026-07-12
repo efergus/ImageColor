@@ -1,6 +1,6 @@
 import { d, type StorageFlag, type TgpuBuffer, type TgpuFixedSampler, type TgpuQuerySet, type TgpuRenderPipeline, type TgpuRoot, type TgpuTexture } from "typegpu";
 import { once, onceBindGroup } from "../../lib/gpu/gpu_utils";
-import { computeOptions, filterBindLayout, filterFragment, filterOptions, quadVertex, textureRenderLayout, weightCalculation, weightCalculationLayout, processWeights, weightTransferLayout, weightTextureFormat, blur, weightProcessingLayout, imageFragment, triangleFragment, cameraBindLayout, cameraUniform, colorSpaceSlot, linearRgbColorSpace, srgbColorSpace, oklabColorSpace, colorSpaceInverseSlot, linearRgbColorSpaceInverse, srgbColorSpaceInverse, oklabColorSpaceInverse, hsvColorSpace, hsvColorSpaceInverse, hslColorSpace, hslColorSpaceInverse } from "./shaders";
+import { computeOptions, filterBindLayout, filterFragment, filterOptions, quadVertex, textureRenderLayout, weightCalculation, weightCalculationLayout, processWeights, weightTransferLayout, weightTextureFormat, blur, weightProcessingLayout, imageFragment, triangleFragment, cameraBindLayout, cameraUniform, cloudCompositeFragment, cloudCompositeLayout, cloudCompositeOptions, colorSpaceSlot, linearRgbColorSpace, srgbColorSpace, oklabColorSpace, colorSpaceInverseSlot, linearRgbColorSpaceInverse, srgbColorSpaceInverse, oklabColorSpaceInverse, hsvColorSpace, hsvColorSpaceInverse, hslColorSpace, hslColorSpaceInverse } from "./shaders";
 import { textureDimensions } from "typegpu/std";
 import { ColorSpace } from "./color_utils";
 
@@ -250,10 +250,9 @@ export const colorSpacesConfig = {
     [ColorSpace.linear_rgb]: { label: 'Linear RGB', forward: linearRgbColorSpace, inverse: linearRgbColorSpaceInverse },
 };
 
-export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inputSampler: TgpuFixedSampler, outputView: any, pickView: any, colorSpace: ColorSpace, options: d.Infer<typeof filterOptions>, camera: d.Infer<typeof cameraUniform>) => {
+export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inputSampler: TgpuFixedSampler, outputView: any, pickView: any, colorSpace: ColorSpace, camera: d.Infer<typeof cameraUniform>) => {
     const {
         pipeline,
-        optionsBuffer,
         cameraBuffer
     } = once([renderColorCloud, colorSpace], () => {
         const pipeline = root
@@ -264,38 +263,66 @@ export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inpu
                 vertex: quadVertex,
                 fragment: triangleFragment,
                 targets: {
-                    color: { format: navigator.gpu.getPreferredCanvasFormat() },
+                    color: { format: 'rgba8unorm' },
                     pick: { format: 'rgba8unorm' }
                 }
             }).withTimestampWrites(timestampOptions(root, 'renderColorCloud'));
-        const optionsBuffer = root.createBuffer(filterOptions).$usage('uniform');
         const cameraBuffer = root.createBuffer(cameraUniform).$usage('uniform');
-        return { pipeline, optionsBuffer, cameraBuffer };
+        return { pipeline, cameraBuffer };
     });
 
     const inputTextureView = once([renderColorCloud, inputTexture], () => {
         return (inputTexture as any).createView('sampled');
     });
 
-    const bindGroup = onceBindGroup(root, textureRenderLayout, {
-        texture: inputTextureView,
-        sampler: inputSampler,
-        options: optionsBuffer
-    });
-
     const cameraBindGroup = onceBindGroup(root, cameraBindLayout, {
-        options: optionsBuffer,
         cameraUniform: cameraBuffer,
         weightTexture: inputTextureView,
         weightSampler: inputSampler
     })
 
-    optionsBuffer.write(options);
     cameraBuffer.write(camera);
 
-    pipeline.with(bindGroup).with(cameraBindGroup)
+    pipeline.with(cameraBindGroup)
         .withColorAttachment({
             color: { view: outputView },
             pick: { view: pickView }
         }).draw(6);
+}
+
+export const compositeColorCloud = (root: TgpuRoot, cloudTexture: TgpuTexture, pickTexture: TgpuTexture, inputSampler: TgpuFixedSampler, outputView: any, options: d.Infer<typeof cloudCompositeOptions>) => {
+    const {
+        pipeline,
+        optionsBuffer
+    } = once(compositeColorCloud, () => {
+        const pipeline = root
+            .createRenderPipeline({
+                primitive: { topology: 'triangle-list' },
+                vertex: quadVertex,
+                fragment: cloudCompositeFragment
+            }).withTimestampWrites(timestampOptions(root, 'compositeColorCloud'));
+        const optionsBuffer = root.createBuffer(cloudCompositeOptions).$usage('uniform');
+        return { pipeline, optionsBuffer };
+    });
+
+    const cloudTextureView = once([compositeColorCloud, cloudTexture], () => {
+        return (cloudTexture as any).createView('sampled');
+    });
+
+    const pickTextureView = once([compositeColorCloud, pickTexture], () => {
+        return (pickTexture as any).createView('sampled');
+    });
+
+    const bindGroup = onceBindGroup(root, cloudCompositeLayout, {
+        cloudTexture: cloudTextureView,
+        pickTexture: pickTextureView,
+        sampler: inputSampler,
+        options: optionsBuffer
+    });
+
+    optionsBuffer.write(options);
+
+    pipeline.with(bindGroup).withColorAttachment({
+        view: outputView
+    }).draw(6);
 }
