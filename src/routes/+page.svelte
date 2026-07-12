@@ -5,6 +5,7 @@
 	<nav>
 		<a class="btn" href="/color">Color Cloud</a>
 		<a class="btn" href="/wave">Wave</a>
+		<a class="btn" href="/life">Game of Life</a>
 	</nav>
 </div>
 
