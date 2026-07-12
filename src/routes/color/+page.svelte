@@ -992,20 +992,6 @@
 		aspect-ratio: 4/3;
 	}
 
-	.radio-group {
-		display: flex;
-		gap: 1rem;
-		align-items: center;
-		margin-top: 1rem;
-	}
-
-	.radio-group label {
-		display: flex;
-		align-items: center;
-		gap: 0.25rem;
-		cursor: pointer;
-	}
-
 	.controls {
 		display: flex;
 		align-items: center;
