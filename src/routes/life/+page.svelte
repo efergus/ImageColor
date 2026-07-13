@@ -22,17 +22,50 @@
 	let discreteness = $state(1);
 	let linearChange = $state(false);
 
-	// Neighbor-sum boundaries between the starve | stay | grow | crowd
-	// regions; the maximum possible sum is 8 live neighbors.
-	let thresholds = $state([1.5, 2.5, 3.5]);
-	const thresholdMax = 8;
-	// Tick marks at every half neighbor count, excluding the track ends.
-	const thresholdTicks = Array.from({ length: thresholdMax * 2 - 1 }, (_, i) => (i + 1) / 2);
+	// How far the neighborhood extends around each cell, in cells.
+	let neighborWindow = $state(1);
+	const maxNeighbors = (window: number) => (2 * window + 1) ** 2 - 1;
+	const thresholdMax = $derived(maxNeighbors(neighborWindow));
+
+	// The threshold slider is logarithmic: thumb position 0..1 maps
+	// exponentially to a neighbor total between minTotal and the window
+	// maximum.
+	const minTotal = 0.5;
+	const positionToTotal = (p: number, max: number) => minTotal * Math.pow(max / minTotal, p);
+	const totalToPosition = (total: number, max: number) =>
+		Math.log(total / minTotal) / Math.log(max / minTotal);
+
+	// Thumb positions are the source of truth so the slider's value is
+	// always exactly what it last emitted; deriving them from the thresholds
+	// instead would loop, as step snapping never converges through the log
+	// round trip.
+	let thresholdPositions = $state([1.5, 2.5, 3.5].map((t) => totalToPosition(t, maxNeighbors(1))));
+	// Boundaries between the starve | stay | grow | crowd regions as the
+	// average value of the cells in the window (0..1), so the rule keeps its
+	// meaning when the window changes. The UI shows neighbor totals.
+	const thresholds = $derived(
+		thresholdPositions.map((p) => positionToTotal(p, thresholdMax) / thresholdMax)
+	);
+	const formatTotal = (t: number) => {
+		const total = t * thresholdMax;
+		return total >= 10 ? total.toFixed(0) : total.toFixed(1);
+	};
+
+	// Tick marks at a 1-2-5 sequence of neighbor totals, major at powers of
+	// ten.
+	const thresholdTicks = $derived(
+		[1, 2, 5, 10, 20, 50, 100, 200, 400]
+			.filter((total) => total < thresholdMax)
+			.map((total) => ({
+				position: totalToPosition(total, thresholdMax),
+				major: Number.isInteger(Math.log10(total))
+			}))
+	);
 	const thresholdSections = $derived([
-		{ color: 'bg-red-500/70', from: 0, to: thresholds[0] },
-		{ color: 'bg-blue-600/70', from: thresholds[0], to: thresholds[1] },
-		{ color: 'bg-green-500/70', from: thresholds[1], to: thresholds[2] },
-		{ color: 'bg-amber-500/70', from: thresholds[2], to: thresholdMax }
+		{ color: 'bg-red-500/70', from: 0, to: thresholdPositions[0] },
+		{ color: 'bg-blue-600/70', from: thresholdPositions[0], to: thresholdPositions[1] },
+		{ color: 'bg-green-500/70', from: thresholdPositions[1], to: thresholdPositions[2] },
+		{ color: 'bg-amber-500/70', from: thresholdPositions[2], to: 1 }
 	]);
 
 	let canvas: HTMLCanvasElement;
@@ -178,7 +211,8 @@
 			stay: thresholds[0],
 			grow: thresholds[1],
 			crowd: thresholds[2],
-			linear: linearChange
+			linear: linearChange,
+			window: neighborWindow
 		});
 		textures = [textures[1], textures[0]];
 		needsRender = true;
@@ -338,37 +372,34 @@
 	</div>
 
 	<span>
-		Starve {thresholds[0].toFixed(1)} stay {thresholds[1].toFixed(1)} grow {thresholds[2].toFixed(
-			1
+		Starve {formatTotal(thresholds[0])} stay {formatTotal(thresholds[1])} grow {formatTotal(
+			thresholds[2]
 		)} crowd
 	</span>
 	<Slider.Root
 		type="multiple"
-		value={thresholds}
+		value={thresholdPositions}
 		min={0}
-		max={thresholdMax}
-		step={0.1}
+		max={1}
+		step={0.001}
 		class="relative flex w-full touch-none items-center select-none"
 		onValueChange={(v) => {
-			thresholds = v;
+			thresholdPositions = v;
 		}}
 	>
 		<span class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20">
 			{#each thresholdSections as section}
 				<span
 					class="absolute h-full {section.color}"
-					style="left: {(section.from / thresholdMax) * 100}%; width: {((section.to -
-						section.from) /
-						thresholdMax) *
-						100}%"
+					style="left: {section.from * 100}%; width: {(section.to - section.from) * 100}%"
 				></span>
 			{/each}
 			{#each thresholdTicks as tick}
 				<span
-					class="absolute w-px -translate-x-1/2 {Number.isInteger(tick)
+					class="absolute w-px -translate-x-1/2 {tick.major
 						? 'top-0 h-full bg-white/70'
 						: 'top-1/4 h-1/2 bg-white/35'}"
-					style="left: {(tick / thresholdMax) * 100}%"
+					style="left: {tick.position * 100}%"
 				></span>
 			{/each}
 		</span>
@@ -378,6 +409,34 @@
 				class="block size-[20px] cursor-pointer rounded-full border-2 border-blue-600 bg-white shadow-sm transition-colors hover:border-white/30 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50 data-active:scale-[0.98] data-active:border-white/30"
 			/>
 		{/each}
+	</Slider.Root>
+
+	<span>Window: {neighborWindow} {neighborWindow === 1 ? 'cell' : 'cells'}</span>
+	<Slider.Root
+		type="single"
+		value={neighborWindow}
+		min={1}
+		max={10}
+		step={1}
+		class="relative flex w-full touch-none items-center select-none"
+		onValueChange={(v) => {
+			// Reposition the thumbs on the new scale so each threshold keeps
+			// its average value, clamping to the reachable range.
+			const fractions = [...thresholds];
+			neighborWindow = v;
+			const max = maxNeighbors(v);
+			thresholdPositions = fractions.map((f) =>
+				Math.min(Math.max(totalToPosition(f * max, max), 0), 1)
+			);
+		}}
+	>
+		<span class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20">
+			<Slider.Range class="absolute h-full bg-blue-600" />
+		</span>
+		<Slider.Thumb
+			index={0}
+			class="block size-[20px] cursor-pointer rounded-full border-2 border-blue-600 bg-white shadow-sm transition-colors hover:border-white/30 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50 data-active:scale-[0.98] data-active:border-white/30"
+		/>
 	</Slider.Root>
 
 	<span>Cell size: {cellSize} px</span>

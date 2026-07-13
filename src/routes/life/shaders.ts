@@ -13,10 +13,12 @@ const cellCoord = d.struct({
 });
 const stepConstants = d.struct({
     discreteness: d.f32,
+    // Region boundaries expressed as the average neighbor value in [0, 1].
     stay: d.f32,
     grow: d.f32,
     crowd: d.f32,
-    linear: d.u32
+    linear: d.u32,
+    window: d.u32
 });
 
 export const lifeStateFormat = 'r32float';
@@ -37,30 +39,35 @@ export const applyLifeStep = (x: number, y: number) => {
     'use gpu';
     const width = lifeStepLayout.$.size.width;
     const height = lifeStepLayout.$.size.height;
+    const window = lifeStepLayout.$.constants.window;
 
-    // Toroidal wrap-around neighborhood.
-    const left = (x + width - 1) % width;
-    const right = (x + 1) % width;
-    const up = (y + height - 1) % height;
-    const down = (y + 1) % height;
-
-    const neighbors =
-        cellAt(left, up) + cellAt(x, up) + cellAt(right, up) +
-        cellAt(left, y) + cellAt(right, y) +
-        cellAt(left, down) + cellAt(x, down) + cellAt(right, down);
+    // Sum every cell in the (2*window+1)^2 square around (x, y) with toroidal
+    // wrap-around, then drop the center cell. The window*(size-1) offset is
+    // a multiple of the size plus the -window shift, keeping the u32
+    // arithmetic non-negative before the modulo.
+    let total = d.f32(0.0);
+    for (let dy = d.u32(0); dy <= 2 * window; dy++) {
+        for (let dx = d.u32(0); dx <= 2 * window; dx++) {
+            const nx = (x + dx + window * (width - 1)) % width;
+            const ny = (y + dy + window * (height - 1)) % height;
+            total = total + cellAt(nx, ny);
+        }
+    }
 
     const alive = cellAt(x, y);
 
     // The thresholds are the boundaries between the four regions of the
-    // neighbor sum: starve | stay | grow | crowd. The defaults sit at
-    // half-integers so exact integer neighbor counts land squarely inside a
-    // region.
+    // average neighbor value: starve | stay | grow | crowd. Comparing
+    // averages rather than totals keeps the rule invariant to window size.
+    const count = (2 * window + 1) * (2 * window + 1) - 1;
+    const average = (total - alive) / d.f32(count);
+
     // Starve and crowd both die off; only the middle two regions differ.
     let target = d.f32(0.0);
-    if (neighbors >= lifeStepLayout.$.constants.grow && neighbors < lifeStepLayout.$.constants.crowd) {
+    if (average >= lifeStepLayout.$.constants.grow && average < lifeStepLayout.$.constants.crowd) {
         // Birth zone: alive regardless of current state.
         target = 1.0;
-    } else if (neighbors >= lifeStepLayout.$.constants.stay && neighbors < lifeStepLayout.$.constants.grow) {
+    } else if (average >= lifeStepLayout.$.constants.stay && average < lifeStepLayout.$.constants.grow) {
         // Stasis: keep the current state.
         target = alive;
     }
@@ -84,7 +91,8 @@ export const gpuLifeStep = (root: TgpuRoot, current: TgpuTexture, next: TgpuText
     stay: number,
     grow: number,
     crowd: number,
-    linear: boolean
+    linear: boolean,
+    window: number
 }) => {
     const {
         pipeline,
@@ -114,7 +122,8 @@ export const gpuLifeStep = (root: TgpuRoot, current: TgpuTexture, next: TgpuText
         stay: options.stay,
         grow: options.grow,
         crowd: options.crowd,
-        linear: options.linear ? 1 : 0
+        linear: options.linear ? 1 : 0,
+        window: options.window
     });
 
     pipeline.with(bindGroup).dispatchThreads(options.width, options.height);
