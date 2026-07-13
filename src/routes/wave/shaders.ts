@@ -9,15 +9,24 @@ const array2dSize = d.struct({
 });
 const waveFunctionConstants = d.struct({
     speed: d.f32,
-    deltat: d.f32
+    deltat: d.f32,
+    time: d.f32
 });
 const scalarArray = d.arrayOf(d.f32);
+
+export const emitterData = d.struct({
+    frequency: d.f32,
+    phase: d.f32,
+    amplitude: d.f32
+});
+const emitterArray = d.arrayOf(emitterData);
 
 export const waveFunctionLayout = tgpu.bindGroupLayout({
     size: { uniform: array2dSize },
     constants: { uniform: waveFunctionConstants },
     refraction: { storage: scalarArray, access: 'readonly' },
     damping: { storage: scalarArray, access: 'readonly' },
+    emitters: { storage: emitterArray, access: 'readonly' },
     prevX: { storage: scalarArray, access: 'readonly' },
     currX: { storage: scalarArray, access: 'readonly' },
     nextX: { storage: scalarArray, access: 'mutable' },
@@ -54,7 +63,17 @@ export const applyWaveFunction = (x: number, y: number) => {
     // semi-implicit central difference so sigma=0 reduces to the plain scheme.
     const sigma = waveFunctionLayout.$.damping[idx];
     const halfSigmaDt = sigma * deltat * 0.5;
-    const updated = (2 * curr[idx] - prev[idx] * (1 - halfSigmaDt) + c2dt2 * laplacian) / (1 + halfSigmaDt);
+    let updated = (2 * curr[idx] - prev[idx] * (1 - halfSigmaDt) + c2dt2 * laplacian) / (1 + halfSigmaDt);
+
+    // Hard source: emitter cells are clamped to their own oscillation instead
+    // of evolving under the wave equation.
+    const amplitude = waveFunctionLayout.$.emitters[idx].amplitude;
+    if (amplitude > 0) {
+        const frequency = waveFunctionLayout.$.emitters[idx].frequency;
+        const phase = waveFunctionLayout.$.emitters[idx].phase;
+        const time = waveFunctionLayout.$.constants.time;
+        updated = amplitude * std.sin(6.28318530718 * frequency * time + phase);
+    }
 
     waveFunctionLayout.$.nextX[idx] = updated;
 }
@@ -78,11 +97,13 @@ export const waveFunctionRunner = tgpu.computeFn({
 });
 
 type GPUArray = TgpuBuffer<d.WgslArray<d.F32>> & StorageFlag;
-export const gpuWaveFunction = (root: TgpuRoot, prevX: GPUArray, currX: GPUArray, nextX: GPUArray, refraction: GPUArray, damping: GPUArray, options: {
+export type EmitterArray = TgpuBuffer<d.WgslArray<typeof emitterData>> & StorageFlag;
+export const gpuWaveFunction = (root: TgpuRoot, prevX: GPUArray, currX: GPUArray, nextX: GPUArray, refraction: GPUArray, damping: GPUArray, emitters: EmitterArray, options: {
     width: number,
     height: number,
     speed: number,
-    deltat: number
+    deltat: number,
+    time: number
 }) => {
     const {
         pipeline,
@@ -106,6 +127,7 @@ export const gpuWaveFunction = (root: TgpuRoot, prevX: GPUArray, currX: GPUArray
         constants: constantsUniform,
         refraction,
         damping,
+        emitters,
         prevX,
         currX,
         nextX
@@ -118,7 +140,8 @@ export const gpuWaveFunction = (root: TgpuRoot, prevX: GPUArray, currX: GPUArray
 
     constantsUniform.write({
         speed: options.speed,
-        deltat: options.deltat
+        deltat: options.deltat,
+        time: options.time
     });
 
     pipeline.with(bindGroup).dispatchWorkgroups(Math.ceil(options.width / 8), Math.ceil(options.height / 8));
@@ -128,6 +151,7 @@ export const waveRenderLayout = tgpu.bindGroupLayout({
     size: { uniform: array2dSize },
     field: { storage: scalarArray, access: 'readonly' },
     refraction: { storage: scalarArray, access: 'readonly' },
+    emitters: { storage: emitterArray, access: 'readonly' },
 });
 
 export const waveFragmentOutput = d.struct({
@@ -144,12 +168,15 @@ export const waveFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof waveFragment
     const value = waveRenderLayout.$.field[idx];
     const brightness = std.clamp(0.5 + 0.5 * value, 0.0, 1.0);
     const tint = std.clamp((waveRenderLayout.$.refraction[idx] - 1.0) * 0.4, 0.0, 0.5);
+    const base = d.vec3f(brightness * (1.0 - tint), brightness * (1.0 - tint), std.min(brightness + tint, 1.0));
+    const emitterMark = std.select(0.0, 0.35, waveRenderLayout.$.emitters[idx].amplitude > 0);
+    const color = std.mix(base, d.vec3f(1.0, 0.55, 0.1), emitterMark);
     return {
-        color: d.vec4f(brightness * (1.0 - tint), brightness * (1.0 - tint), std.min(brightness + tint, 1.0), 1.0)
+        color: d.vec4f(color, 1.0)
     };
 }
 
-export const renderWave = (root: TgpuRoot, field: GPUArray, refraction: GPUArray, outputView: any, options: {
+export const renderWave = (root: TgpuRoot, field: GPUArray, refraction: GPUArray, emitters: EmitterArray, outputView: any, options: {
     width: number,
     height: number
 }) => {
@@ -172,7 +199,8 @@ export const renderWave = (root: TgpuRoot, field: GPUArray, refraction: GPUArray
     const bindGroup = onceBindGroup(root, waveRenderLayout, {
         size: sizeUniform,
         field,
-        refraction
+        refraction,
+        emitters
     });
 
     sizeUniform.write({
