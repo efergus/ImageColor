@@ -10,7 +10,10 @@ const array2dSize = d.struct({
 const waveFunctionConstants = d.struct({
     speed: d.f32,
     deltat: d.f32,
-    time: d.f32
+    time: d.f32,
+    // 0 = clamp neighbors to the edge (reflective wall), 1 = periodic wrap.
+    boundary: d.u32,
+    screenAttenuation: d.f32
 });
 const scalarArray = d.arrayOf(d.f32);
 
@@ -21,12 +24,19 @@ export const emitterData = d.struct({
 });
 const emitterArray = d.arrayOf(emitterData);
 
+export const screenData = d.struct({
+    isScreen: d.f32,
+    accum: d.f32
+});
+const screenArray = d.arrayOf(screenData);
+
 export const waveFunctionLayout = tgpu.bindGroupLayout({
     size: { uniform: array2dSize },
     constants: { uniform: waveFunctionConstants },
     refraction: { storage: scalarArray, access: 'readonly' },
     damping: { storage: scalarArray, access: 'readonly' },
     emitters: { storage: emitterArray, access: 'readonly' },
+    screen: { storage: screenArray, access: 'mutable' },
     prevX: { storage: scalarArray, access: 'readonly' },
     currX: { storage: scalarArray, access: 'readonly' },
     nextX: { storage: scalarArray, access: 'mutable' },
@@ -46,10 +56,33 @@ export const applyWaveFunction = (x: number, y: number) => {
     const deltat = waveFunctionLayout.$.constants.deltat;
 
     const idx = arrayIndex(x, y, width);
-    const up = arrayIndex(x, y - 1, width);
-    const down = arrayIndex(x, y + 1, width);
-    const left = arrayIndex(x - 1, y, width);
-    const right = arrayIndex(x + 1, y, width);
+
+    // Neighbor lookups honor the boundary mode: periodic wraps to the opposite
+    // edge, otherwise coordinates clamp to the edge cell (a zero-gradient wall
+    // that reflects incoming waves).
+    const xi = d.i32(x);
+    const yi = d.i32(y);
+    const wi = d.i32(width);
+    const hi = d.i32(height);
+    let xLeft = xi - 1;
+    let xRight = xi + 1;
+    let yUp = yi - 1;
+    let yDown = yi + 1;
+    if (waveFunctionLayout.$.constants.boundary === 1) {
+        xLeft = (xLeft + wi) % wi;
+        xRight = xRight % wi;
+        yUp = (yUp + hi) % hi;
+        yDown = yDown % hi;
+    } else {
+        xLeft = std.max(xLeft, 0);
+        xRight = std.min(xRight, wi - 1);
+        yUp = std.max(yUp, 0);
+        yDown = std.min(yDown, hi - 1);
+    }
+    const up = arrayIndex(x, d.u32(yUp), width);
+    const down = arrayIndex(x, d.u32(yDown), width);
+    const left = arrayIndex(d.u32(xLeft), y, width);
+    const right = arrayIndex(d.u32(xRight), y, width);
 
     const curr = waveFunctionLayout.$.currX;
     const prev = waveFunctionLayout.$.prevX;
@@ -76,6 +109,16 @@ export const applyWaveFunction = (x: number, y: number) => {
     }
 
     waveFunctionLayout.$.nextX[idx] = updated;
+
+    // Screen cells integrate wave energy: accumulate |u|^2 while bleeding off
+    // a configurable fraction of the stored intensity so the value converges
+    // to a time-average instead of growing without bound.
+    if (waveFunctionLayout.$.screen[idx].isScreen > 0) {
+        const attenuation = waveFunctionLayout.$.constants.screenAttenuation;
+        const accum = waveFunctionLayout.$.screen[idx].accum;
+        waveFunctionLayout.$.screen[idx].accum =
+            accum * (1 - attenuation * deltat) + updated * updated * deltat;
+    }
 }
 
 export const waveFunctionRunner = tgpu.computeFn({
@@ -98,12 +141,15 @@ export const waveFunctionRunner = tgpu.computeFn({
 
 type GPUArray = TgpuBuffer<d.WgslArray<d.F32>> & StorageFlag;
 export type EmitterArray = TgpuBuffer<d.WgslArray<typeof emitterData>> & StorageFlag;
-export const gpuWaveFunction = (root: TgpuRoot, prevX: GPUArray, currX: GPUArray, nextX: GPUArray, refraction: GPUArray, damping: GPUArray, emitters: EmitterArray, options: {
+export type ScreenArray = TgpuBuffer<d.WgslArray<typeof screenData>> & StorageFlag;
+export const gpuWaveFunction = (root: TgpuRoot, prevX: GPUArray, currX: GPUArray, nextX: GPUArray, refraction: GPUArray, damping: GPUArray, emitters: EmitterArray, screen: ScreenArray, options: {
     width: number,
     height: number,
     speed: number,
     deltat: number,
-    time: number
+    time: number,
+    boundary: number,
+    screenAttenuation: number
 }) => {
     const {
         pipeline,
@@ -128,6 +174,7 @@ export const gpuWaveFunction = (root: TgpuRoot, prevX: GPUArray, currX: GPUArray
         refraction,
         damping,
         emitters,
+        screen,
         prevX,
         currX,
         nextX
@@ -141,7 +188,9 @@ export const gpuWaveFunction = (root: TgpuRoot, prevX: GPUArray, currX: GPUArray
     constantsUniform.write({
         speed: options.speed,
         deltat: options.deltat,
-        time: options.time
+        time: options.time,
+        boundary: options.boundary,
+        screenAttenuation: options.screenAttenuation
     });
 
     pipeline.with(bindGroup).dispatchWorkgroups(Math.ceil(options.width / 8), Math.ceil(options.height / 8));
@@ -152,6 +201,8 @@ export const waveRenderLayout = tgpu.bindGroupLayout({
     field: { storage: scalarArray, access: 'readonly' },
     refraction: { storage: scalarArray, access: 'readonly' },
     emitters: { storage: emitterArray, access: 'readonly' },
+    damping: { storage: scalarArray, access: 'readonly' },
+    screen: { storage: screenArray, access: 'readonly' },
 });
 
 export const waveFragmentOutput = d.struct({
@@ -170,13 +221,23 @@ export const waveFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof waveFragment
     const tint = std.clamp((waveRenderLayout.$.refraction[idx] - 1.0) * 0.4, 0.0, 0.5);
     const base = d.vec3f(brightness * (1.0 - tint), brightness * (1.0 - tint), std.min(brightness + tint, 1.0));
     const emitterMark = std.select(0.0, 0.35, waveRenderLayout.$.emitters[idx].amplitude > 0);
-    const color = std.mix(base, d.vec3f(1.0, 0.55, 0.1), emitterMark);
+    const emitterColor = std.mix(base, d.vec3f(1.0, 0.55, 0.1), emitterMark);
+    const dampMark = std.clamp(waveRenderLayout.$.damping[idx] * 0.005, 0.0, 0.4);
+    const waveColor = std.mix(emitterColor, d.vec3f(0.05, 0.15, 0.1), dampMark);
+
+    // Screen cells show their accumulated intensity instead of the live wave,
+    // tone-mapped through 1 - e^-x so bright fringes stay in range, and tinted
+    // green to stand apart from the grayscale wave.
+    const accum = waveRenderLayout.$.screen[idx].accum;
+    const intensity = 1.0 - std.exp(-6.0 * accum);
+    const screenColor = d.vec3f(intensity * 0.6, intensity, intensity * 0.6);
+    const color = std.select(waveColor, screenColor, waveRenderLayout.$.screen[idx].isScreen > 0);
     return {
         color: d.vec4f(color, 1.0)
     };
 }
 
-export const renderWave = (root: TgpuRoot, field: GPUArray, refraction: GPUArray, emitters: EmitterArray, outputView: any, options: {
+export const renderWave = (root: TgpuRoot, field: GPUArray, refraction: GPUArray, emitters: EmitterArray, damping: GPUArray, screen: ScreenArray, outputView: any, options: {
     width: number,
     height: number
 }) => {
@@ -200,7 +261,9 @@ export const renderWave = (root: TgpuRoot, field: GPUArray, refraction: GPUArray
         size: sizeUniform,
         field,
         refraction,
-        emitters
+        emitters,
+        damping,
+        screen
     });
 
     sizeUniform.write({

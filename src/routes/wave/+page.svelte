@@ -2,17 +2,30 @@
 	import { Slider } from 'bits-ui';
 	import { onMount } from 'svelte';
 	import tgpu, { d, type StorageFlag, type TgpuBuffer } from 'typegpu';
-	import { emitterData, gpuWaveFunction, renderWave, type EmitterArray } from './shaders';
+	import {
+		emitterData,
+		screenData,
+		gpuWaveFunction,
+		renderWave,
+		type EmitterArray,
+		type ScreenArray
+	} from './shaders';
 
-	type Tool = 'emitter' | 'refractor' | 'eraser';
-	const tools: Tool[] = ['emitter', 'refractor', 'eraser'];
+	type Tool = 'poke' | 'emitter' | 'refractor' | 'damper' | 'screen' | 'eraser';
+	const tools: Tool[] = ['poke', 'emitter', 'refractor', 'damper', 'screen', 'eraser'];
 
-	let tool: Tool = $state('emitter');
-	let penSize = $state(10);
+	type Boundary = 'absorbing' | 'reflective' | 'periodic';
+	const boundaries: Boundary[] = ['absorbing', 'reflective', 'periodic'];
+
+	let tool: Tool = $state('poke');
+	let boundary: Boundary = $state('absorbing');
+	let penSize = $state(4);
 	let frequency = $state(2);
-	let amplitude = $state(1);
+	let amplitude = $state(10);
 	let phase = $state(0);
 	let refractionIndex = $state(1.5);
+	let dampingIntensity = $state(100);
+	let screenAttenuation = $state(0);
 	let speed = $state(100);
 	let substeps = $state(4);
 
@@ -25,9 +38,9 @@
 	// Sponge boundary layer: sigma ramps quadratically from 0 at the interior
 	// edge of the band up to sigmaMax at the wall, so waves lose most of their
 	// energy before ever reaching the (still fully reflective) grid edge.
-	const spongeBandWidth = 20;
-	const spongeSigmaTopBottom = 400;
-	const spongeSigmaLeftRight = 1;
+	const spongeBandWidth = 60;
+	const spongeSigmaTopBottom = 40;
+	const spongeSigmaLeftRight = 40;
 
 	const buildSpongeField = () => {
 		const data = new Float32Array(width * height);
@@ -65,6 +78,29 @@
 	let refraction: GPUArray | null = null;
 	let damping: GPUArray | null = null;
 	let emitters: EmitterArray | null = null;
+	let screen: ScreenArray | null = null;
+
+	// The damping buffer holds the boundary sponge (absorbing mode only) plus
+	// whatever the user painted with the damper tool, so switching boundary
+	// modes rebuilds the sponge without losing painted damping.
+	const spongeField = buildSpongeField();
+	const paintedDamping = new Float32Array(width * height);
+
+	const baseDamping = (idx: number) => (boundary === 'absorbing' ? spongeField[idx] : 0);
+
+	const writeDamping = () => {
+		if (!damping) return;
+		const data = new Float32Array(width * height);
+		for (let i = 0; i < data.length; i++) {
+			data[i] = baseDamping(i) + paintedDamping[i];
+		}
+		damping.write(data.buffer);
+	};
+
+	const setBoundary = (b: Boundary) => {
+		boundary = b;
+		writeDamping();
+	};
 
 	let downPos: { x: number; y: number } | null = null;
 	let dragging = false;
@@ -92,8 +128,14 @@
 	type EmitterValue = { frequency: number; phase: number; amplitude: number };
 
 	const paint = (e: PointerEvent) => {
-		if (!refraction || !emitters) return;
-		if (tool === 'emitter') {
+		if (!refraction || !emitters || !buffers || !damping || !screen) return;
+		if (tool === 'poke') {
+			const values: Record<number, number> = {};
+			forEachPenCell(e, (idx) => {
+				values[idx] = 1;
+			});
+			buffers[1].patch(values);
+		} else if (tool === 'emitter') {
 			const values: Record<number, EmitterValue> = {};
 			forEachPenCell(e, (idx) => {
 				values[idx] = { frequency, phase, amplitude };
@@ -105,15 +147,35 @@
 				values[idx] = refractionIndex;
 			});
 			refraction.patch(values);
+		} else if (tool === 'damper') {
+			const values: Record<number, number> = {};
+			forEachPenCell(e, (idx) => {
+				paintedDamping[idx] = dampingIntensity;
+				values[idx] = baseDamping(idx) + dampingIntensity;
+			});
+			damping.patch(values);
+		} else if (tool === 'screen') {
+			const values: Record<number, { isScreen: number }> = {};
+			forEachPenCell(e, (idx) => {
+				values[idx] = { isScreen: 1 };
+			});
+			screen.patch(values);
 		} else {
 			const emitterValues: Record<number, EmitterValue> = {};
 			const refractionValues: Record<number, number> = {};
+			const dampingValues: Record<number, number> = {};
+			const screenValues: Record<number, { isScreen: number; accum: number }> = {};
 			forEachPenCell(e, (idx) => {
 				emitterValues[idx] = { frequency: 0, phase: 0, amplitude: 0 };
 				refractionValues[idx] = 1;
+				paintedDamping[idx] = 0;
+				dampingValues[idx] = baseDamping(idx);
+				screenValues[idx] = { isScreen: 0, accum: 0 };
 			});
 			emitters.patch(emitterValues);
 			refraction.patch(refractionValues);
+			damping.patch(dampingValues);
+			screen.patch(screenValues);
 		}
 	};
 
@@ -156,28 +218,34 @@
 		refraction.write(new Float32Array(width * height).fill(1).buffer);
 
 		damping = root.createBuffer(d.arrayOf(d.f32, width * height)).$usage('storage');
-		damping.write(buildSpongeField().buffer);
+		writeDamping();
 
 		emitters = root.createBuffer(d.arrayOf(emitterData, width * height)).$usage('storage');
+		screen = root.createBuffer(d.arrayOf(screenData, width * height)).$usage('storage');
 
 		let simTime = 0;
 		const frame = () => {
-			if (!buffers || !refraction || !damping || !emitters) return;
+			if (!buffers || !refraction || !damping || !emitters || !screen) return;
 			const dt = deltat / substeps;
 			let bufs: GPUArray[] = buffers;
 			for (let i = 0; i < substeps; i++) {
-				gpuWaveFunction(root, bufs[0], bufs[1], bufs[2], refraction, damping, emitters, {
+				gpuWaveFunction(root, bufs[0], bufs[1], bufs[2], refraction, damping, emitters, screen, {
 					width,
 					height,
 					speed,
 					deltat: dt,
-					time: simTime
+					time: simTime,
+					boundary: boundary === 'periodic' ? 1 : 0,
+					screenAttenuation
 				});
 				simTime += dt;
 				bufs = [bufs[1], bufs[2], bufs[0]];
 			}
 			buffers = bufs;
-			renderWave(root, bufs[1], refraction, emitters, context, { width, height });
+			renderWave(root, bufs[1], refraction, emitters, damping, screen, context, {
+				width,
+				height
+			});
 			requestAnimationFrame(frame);
 		};
 		frame();
@@ -237,6 +305,20 @@
 		{/each}
 	</div>
 
+	<div class="my-2 flex items-center gap-2">
+		<span>Boundary:</span>
+		{#each boundaries as b (b)}
+			<button
+				class="cursor-pointer rounded px-4 py-1 capitalize transition-colors {boundary === b
+					? 'bg-blue-600 text-white'
+					: 'bg-white/20 hover:bg-white/30'}"
+				onclick={() => setBoundary(b)}
+			>
+				{b}
+			</button>
+		{/each}
+	</div>
+
 	{@render labeledSlider('Pen size', penSize, 1, 50, 1, (v) => (penSize = v))}
 
 	{#if tool === 'emitter'}
@@ -252,8 +334,26 @@
 			0.01,
 			(v) => (refractionIndex = v)
 		)}
+	{:else if tool === 'damper'}
+		{@render labeledSlider(
+			'Damping intensity',
+			dampingIntensity,
+			1,
+			400,
+			1,
+			(v) => (dampingIntensity = v)
+		)}
+	{:else if tool === 'screen'}
+		{@render labeledSlider(
+			'Attenuation',
+			screenAttenuation,
+			0,
+			5,
+			0.01,
+			(v) => (screenAttenuation = v)
+		)}
 	{/if}
 
-	{@render labeledSlider('Speed', speed, 10, 1000, 0.01, (v) => (speed = v))}
+	{@render labeledSlider('Speed', speed, 10, 200, 0.01, (v) => (speed = v))}
 	{@render labeledSlider('Substeps', substeps, 1, 32, 1, (v) => (substeps = v))}
 </div>
