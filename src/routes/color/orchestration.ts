@@ -358,24 +358,28 @@ export const renderRasterScene = (
 	meshes: Mesh[]
 ) => {
 	const { pipeline, cameraBuffer } = once(renderRasterScene, () => {
-		const pipeline = root
-			.createRenderPipeline({
-				vertex: meshVertex,
-				fragment: meshFragment,
-				attribs: { position: meshPositionLayout.attrib },
-				targets: { format: 'rgba8unorm' },
-				depthStencil: {
-					format: 'depth24plus',
-					depthWriteEnabled: true,
-					depthCompare: 'less'
-				}
-			})
-			.withTimestampWrites(timestampOptions(root, 'renderRasterScene'));
+		const pipeline = root.createRenderPipeline({
+			vertex: meshVertex,
+			fragment: meshFragment,
+			attribs: { position: meshPositionLayout.attrib },
+			targets: { format: 'rgba8unorm' },
+			depthStencil: {
+				format: 'depth24plus',
+				depthWriteEnabled: true,
+				depthCompare: 'less'
+			}
+		});
 		const cameraBuffer = root.createBuffer(cameraUniform).$usage('uniform');
 		return { pipeline, cameraBuffer };
 	});
 
 	cameraBuffer.write(camera);
+
+	// Share one command encoder (and one queue.submit) across every mesh's
+	// pass instead of letting each .draw() open its own encoder. A query
+	// index can only be timestamp-written once per encoder, so timing is
+	// only attached to the first mesh's pass.
+	const encoder = root.device.createCommandEncoder();
 
 	meshes.forEach((mesh, i) => {
 		const { vertexBuffer, bindGroup } = once([renderRasterScene, mesh], () => {
@@ -391,7 +395,12 @@ export const renderRasterScene = (
 		});
 
 		const loadOp = i === 0 ? 'clear' : 'load';
-		pipeline
+		let meshPipeline = pipeline.with(encoder);
+		if (i === 0) {
+			meshPipeline = meshPipeline.withTimestampWrites(timestampOptions(root, 'renderRasterScene'));
+		}
+
+		meshPipeline
 			.withColorAttachment({ view: outputTexture, loadOp })
 			.withDepthStencilAttachment({
 				view: depthTexture,
@@ -403,6 +412,8 @@ export const renderRasterScene = (
 			.with(bindGroup)
 			.draw(mesh.vertices.length);
 	});
+
+	root.device.queue.submit([encoder.finish()]);
 };
 
 export const renderColorCloud = (
