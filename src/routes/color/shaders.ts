@@ -383,36 +383,68 @@ export const worldToClip = (
 	return d.vec4f(viewX / (aspect * 0.6), viewY / 0.6, zClip, viewZ);
 };
 
-// Vertex-buffer-driven pipeline for rasterizing arbitrary scene meshes (a
-// flat, non-indexed triangle-list of world-space positions) as flat-colored
-// geometry into the same depth buffer the cloud raymarch reads from.
-export const meshPositionLayout = tgpu.vertexLayout(d.arrayOf(d.vec3f));
-
-export const meshOptions = d.struct({
-	color: d.vec4f
+// Pipeline for rasterizing the cloud box's reference grid faces (bottom/top
+// and the walls) into the same depth buffer the cloud raymarch reads from.
+// Each face is a static quad; only its fade (how much it faces the camera)
+// changes per frame.
+export const gridVertexData = d.struct({
+	position: d.vec3f,
+	uv: d.vec2f
 });
 
-export const meshBindLayout = tgpu.bindGroupLayout({
+export const gridVertexLayout = tgpu.vertexLayout(d.arrayOf(gridVertexData));
+
+export const gridFaceOptions = d.struct({
+	alpha: d.f32,
+	// Grayscale line color, chosen to contrast with the background.
+	color: d.f32
+});
+
+export const gridBindLayout = tgpu.bindGroupLayout({
 	cameraUniform: { uniform: cameraUniform },
-	meshOptions: { uniform: meshOptions }
+	faceOptions: { uniform: gridFaceOptions }
 });
 
-export const meshVertex = tgpu.vertexFn({
-	in: { position: d.vec3f },
-	out: { pos: d.builtin.position }
-})(({ position }) => {
+export const gridVertex = tgpu.vertexFn({
+	in: { position: d.vec3f, uv: d.vec2f },
+	out: { pos: d.builtin.position, uv: d.vec2f }
+})(({ position, uv }) => {
 	'use gpu';
-	const camera = meshBindLayout.$.cameraUniform;
+	const camera = gridBindLayout.$.cameraUniform;
 	return {
-		pos: worldToClip(position, camera.yaw, camera.pitch, camera.radius, camera.aspect)
+		pos: worldToClip(position, camera.yaw, camera.pitch, camera.radius, camera.aspect),
+		uv
 	};
 });
 
-export const meshFragment = tgpu.fragmentFn({
-	out: d.vec4f
-})(() => {
+// How many cells the grid is divided into across each face.
+const gridDivisions = 10;
+
+// Screen-space-anti-aliased distance to the nearest grid line, in [0, 1]
+// (1 = right on a line, 0 = a cell's-width or further from one).
+const gridLineAlpha = (uv: d.v2f) => {
 	'use gpu';
-	return meshBindLayout.$.meshOptions.color;
+	const coord = std.mul(uv, d.f32(gridDivisions));
+	const centered = std.sub(std.fract(std.sub(coord, d.vec2f(0.5, 0.5))), d.vec2f(0.5, 0.5));
+	const dist = std.abs(centered);
+	const width = std.fwidth(coord);
+	const line = std.min(dist.x / width.x, dist.y / width.y);
+	return 1.0 - std.clamp(line, 0.0, 1.0);
+};
+
+export const gridFragment = tgpu.fragmentFn({
+	in: { uv: d.vec2f },
+	out: d.vec4f
+})(({ uv }) => {
+	'use gpu';
+	const alpha = gridLineAlpha(uv) * gridBindLayout.$.faceOptions.alpha;
+	if (alpha < 0.003) {
+		// Discarding (rather than writing a transparent pixel) also skips the
+		// depth write, so faces facing the camera don't occlude the cloud.
+		std.discard();
+	}
+	const color = gridBindLayout.$.faceOptions.color;
+	return d.vec4f(color, color, color, alpha);
 });
 
 export const quadVertex = ({ $vertexIndex: vid }: { $vertexIndex: number }) => {
