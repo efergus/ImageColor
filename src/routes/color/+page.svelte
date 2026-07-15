@@ -44,6 +44,7 @@
 	} from './orchestration';
 	import { once } from '$lib/gpu/gpu_utils';
 	import { ColorSpace, srgb_to_oklab } from './color_utils';
+	import { planeMesh, cylinderMesh } from './geometry';
 
 	const colorSpaces = Object.entries(colorSpacesConfig).map(([value, config]) => ({
 		value: value as ColorSpace,
@@ -76,6 +77,27 @@
 	let textureSize = $state(d.vec2u(128, 128));
 	let startTime = $state(0);
 	let savedRGB: d.v3f | null = $state(null);
+
+	const plane = planeMesh();
+	const horizontalCylinder = cylinderMesh({
+		axis: 'x',
+		length: 1,
+		radius: 0.015,
+		color: d.vec4f(1, 0, 0, 1)
+	});
+	const verticalCylinder = cylinderMesh({
+		axis: 'y',
+		length: 1,
+		radius: 0.015,
+		color: d.vec4f(1, 1, 1, 1)
+	});
+	let showHorizontalCylinder = $state(true);
+	let showVerticalCylinder = $state(true);
+	let sceneMeshes = $derived([
+		plane,
+		...(showHorizontalCylinder ? [horizontalCylinder] : []),
+		...(showVerticalCylinder ? [verticalCylinder] : [])
+	]);
 
 	let gpuState: {
 		root: TgpuRoot;
@@ -387,7 +409,7 @@
 				steps,
 				sensitivity
 			};
-			renderRasterScene(root, rasterTexture, rasterDepthTexture, camera);
+			renderRasterScene(root, rasterTexture, rasterDepthTexture, camera, sceneMeshes);
 			renderColorCloud(
 				root,
 				blurredWeightTexture,
@@ -834,6 +856,38 @@
 							</Select.Content>
 						</Select.Portal>
 					</Select.Root>
+				</div>
+
+				<div class="flex w-full flex-col gap-1">
+					<div class="pl-8 text-sm text-slate-400">
+						<span>Scene Meshes</span>
+					</div>
+					<div class="flex items-center gap-4">
+						<label class="flex items-center gap-2 text-sm text-slate-200">
+							<input
+								type="checkbox"
+								checked={showHorizontalCylinder}
+								onchange={(e) => {
+									showHorizontalCylinder = (e.target as HTMLInputElement).checked;
+									onCloudUpdate();
+									invalidateCaches();
+								}}
+							/>
+							Horizontal cylinder
+						</label>
+						<label class="flex items-center gap-2 text-sm text-slate-200">
+							<input
+								type="checkbox"
+								checked={showVerticalCylinder}
+								onchange={(e) => {
+									showVerticalCylinder = (e.target as HTMLInputElement).checked;
+									onCloudUpdate();
+									invalidateCaches();
+								}}
+							/>
+							Vertical cylinder
+						</label>
+					</div>
 				</div>
 			</div>
 

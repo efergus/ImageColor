@@ -355,10 +355,6 @@ export const cameraBindLayout = tgpu.bindGroupLayout({
 export const rasterNear = 0.05;
 export const rasterFar = 8.0;
 
-export const rasterLayout = tgpu.bindGroupLayout({
-	cameraUniform: { uniform: cameraUniform }
-});
-
 // Projects a world-space point with the exact same camera geometry as
 // cameraRay (tan(halfFov) = 0.6 vertically and 0.6 * aspect horizontally),
 // so rasterized geometry and raymarched volume line up pixel-for-pixel.
@@ -387,35 +383,37 @@ export const worldToClip = (
 	return d.vec4f(viewX / (aspect * 0.6), viewY / 0.6, zClip, viewZ);
 };
 
-export const rasterQuadVertex = ({ $vertexIndex: vid }: { $vertexIndex: number }) => {
-	'use gpu';
-	// A 1x1 vertical plane through the middle of the cloud's unit box.
-	const positions = [
-		d.vec3f(0.0, 0.0, 0.5),
-		d.vec3f(1.0, 0.0, 0.5),
-		d.vec3f(1.0, 1.0, 0.5),
-		d.vec3f(0.0, 0.0, 0.5),
-		d.vec3f(1.0, 1.0, 0.5),
-		d.vec3f(0.0, 1.0, 0.5)
-	];
-	const camera = rasterLayout.$.cameraUniform;
-	return {
-		$position: worldToClip(positions[vid], camera.yaw, camera.pitch, camera.radius, camera.aspect)
-	};
-};
+// Vertex-buffer-driven pipeline for rasterizing arbitrary scene meshes (a
+// flat, non-indexed triangle-list of world-space positions) as flat-colored
+// geometry into the same depth buffer the cloud raymarch reads from.
+export const meshPositionLayout = tgpu.vertexLayout(d.arrayOf(d.vec3f));
 
-export const rasterFragmentOutput = d.struct({
+export const meshOptions = d.struct({
 	color: d.vec4f
 });
 
-// Solid black for now; add a uv varying to rasterQuadVertex when the plane
-// needs actual rasterized content.
-export const rasterFragment = (): d.Infer<typeof rasterFragmentOutput> => {
+export const meshBindLayout = tgpu.bindGroupLayout({
+	cameraUniform: { uniform: cameraUniform },
+	meshOptions: { uniform: meshOptions }
+});
+
+export const meshVertex = tgpu.vertexFn({
+	in: { position: d.vec3f },
+	out: { pos: d.builtin.position }
+})(({ position }) => {
 	'use gpu';
+	const camera = meshBindLayout.$.cameraUniform;
 	return {
-		color: d.vec4f(0.0, 0.0, 0.0, 1.0)
+		pos: worldToClip(position, camera.yaw, camera.pitch, camera.radius, camera.aspect)
 	};
-};
+});
+
+export const meshFragment = tgpu.fragmentFn({
+	out: d.vec4f
+})(() => {
+	'use gpu';
+	return meshBindLayout.$.meshOptions.color;
+});
 
 export const quadVertex = ({ $vertexIndex: vid }: { $vertexIndex: number }) => {
 	'use gpu';

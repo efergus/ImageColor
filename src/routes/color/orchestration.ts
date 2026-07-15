@@ -43,11 +43,14 @@ import {
 	hsvColorSpaceInverse,
 	hslColorSpace,
 	hslColorSpaceInverse,
-	rasterLayout,
-	rasterQuadVertex,
-	rasterFragment
+	meshPositionLayout,
+	meshBindLayout,
+	meshVertex,
+	meshFragment,
+	meshOptions
 } from './shaders';
 import { ColorSpace } from './color_utils';
+import type { Mesh } from './geometry';
 
 // A render pass output: either a texture to draw into or a canvas context.
 type RenderTarget = (TgpuTexture & RenderFlag) | GPUCanvasContext;
@@ -343,24 +346,24 @@ export const colorSpacesConfig = {
 	}
 };
 
-// Rasterizes the scene geometry (for now a single black quad through the
-// middle of the cloud) into a color texture and a depth buffer, using the
-// same camera as the cloud raymarch.
+// Rasterizes an arbitrary set of scene meshes (each a flat-colored,
+// non-indexed triangle list) into a color texture and a depth buffer, using
+// the same camera as the cloud raymarch. The plane that used to be
+// hardcoded here is now just one more mesh, provided by the caller.
 export const renderRasterScene = (
 	root: TgpuRoot,
 	outputTexture: TgpuTexture & RenderFlag,
 	depthTexture: TgpuTexture & RenderFlag & SampledFlag,
-	camera: d.Infer<typeof cameraUniform>
+	camera: d.Infer<typeof cameraUniform>,
+	meshes: Mesh[]
 ) => {
 	const { pipeline, cameraBuffer } = once(renderRasterScene, () => {
 		const pipeline = root
 			.createRenderPipeline({
-				primitive: { topology: 'triangle-list' },
-				vertex: rasterQuadVertex,
-				fragment: rasterFragment,
-				targets: {
-					color: { format: 'rgba8unorm' }
-				},
+				vertex: meshVertex,
+				fragment: meshFragment,
+				attribs: { position: meshPositionLayout.attrib },
+				targets: { format: 'rgba8unorm' },
 				depthStencil: {
 					format: 'depth24plus',
 					depthWriteEnabled: true,
@@ -372,24 +375,34 @@ export const renderRasterScene = (
 		return { pipeline, cameraBuffer };
 	});
 
-	const bindGroup = onceBindGroup(root, rasterLayout, {
-		cameraUniform: cameraBuffer
-	});
-
 	cameraBuffer.write(camera);
 
-	pipeline
-		.with(bindGroup)
-		.withColorAttachment({
-			color: { view: outputTexture }
-		})
-		.withDepthStencilAttachment({
-			view: depthTexture,
-			depthClearValue: 1.0,
-			depthLoadOp: 'clear',
-			depthStoreOp: 'store'
-		})
-		.draw(6);
+	meshes.forEach((mesh, i) => {
+		const { vertexBuffer, bindGroup } = once([renderRasterScene, mesh], () => {
+			const vertexBuffer = root
+				.createBuffer(meshPositionLayout.schemaForCount(mesh.vertices.length), mesh.vertices)
+				.$usage('vertex');
+			const colorBuffer = root.createBuffer(meshOptions, { color: mesh.color }).$usage('uniform');
+			const bindGroup = root.createBindGroup(meshBindLayout, {
+				cameraUniform: cameraBuffer,
+				meshOptions: colorBuffer
+			});
+			return { vertexBuffer, bindGroup };
+		});
+
+		const loadOp = i === 0 ? 'clear' : 'load';
+		pipeline
+			.withColorAttachment({ view: outputTexture, loadOp })
+			.withDepthStencilAttachment({
+				view: depthTexture,
+				depthClearValue: 1.0,
+				depthLoadOp: loadOp,
+				depthStoreOp: 'store'
+			})
+			.with(meshPositionLayout, vertexBuffer)
+			.with(bindGroup)
+			.draw(mesh.vertices.length);
+	});
 };
 
 export const renderColorCloud = (
