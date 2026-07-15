@@ -48,6 +48,7 @@
 		processWeightTexture,
 		blurWeightTexture,
 		renderImage,
+		renderRasterScene,
 		renderColorCloud,
 		compositeColorCloud,
 		readTimings,
@@ -290,6 +291,16 @@
 				.$usage('render', 'sampled')
 		);
 
+	const getDepthTexture = (root: TgpuRoot, uniqueName: string, width: number, height: number) =>
+		once([getDepthTexture, uniqueName, width, height], () =>
+			root
+				.createTexture({
+					size: [width, height],
+					format: 'depth24plus'
+				})
+				.$usage('render', 'sampled')
+		);
+
 	const computeWeightTexture = (tableSize: number) => {
 		if (!gpuState) {
 			console.warn('gpuState is null');
@@ -366,20 +377,39 @@
 			: [colorCanvas.width, colorCanvas.height];
 		const pickTexture = getTexture(root, 'pickTexture', renderSize[0], renderSize[1]);
 		const cloudTexture = getTexture(root, 'cloudTexture', renderSize[0], renderSize[1]);
+		const rasterTexture = getTexture(root, 'rasterTexture', renderSize[0], renderSize[1]);
+		const rasterDepthTexture = getDepthTexture(
+			root,
+			'rasterDepthTexture',
+			renderSize[0],
+			renderSize[1]
+		);
 
 		const cloudDirty = cloudUpdated > cloudRendered || fast !== cloudRenderedFast;
 		if (cloudDirty) {
 			const steps = fast ? 20 : 64;
-			const pickView = (pickTexture as any).createView('render');
-			const cloudView = (cloudTexture as any).createView('render');
-			renderColorCloud(root, blurredWeightTexture, linearSampler, cloudView, pickView, colorSpace, {
+			const camera = {
 				yaw,
 				pitch,
 				radius,
 				aspect: colorCanvas.width / colorCanvas.height,
 				steps,
 				sensitivity
-			});
+			};
+			const pickView = (pickTexture as any).createView('render');
+			const cloudView = (cloudTexture as any).createView('render');
+			const rasterView = (rasterTexture as any).createView('render');
+			renderRasterScene(root, rasterView, rasterDepthTexture, camera);
+			renderColorCloud(
+				root,
+				blurredWeightTexture,
+				linearSampler,
+				rasterDepthTexture,
+				cloudView,
+				pickView,
+				colorSpace,
+				camera
+			);
 			cloudRendered = now;
 			cloudRenderedFast = fast;
 		}
@@ -391,7 +421,7 @@
 			selectedColor
 		});
 
-		compositeColorCloud(root, cloudTexture, pickTexture, linearSampler, context, {
+		compositeColorCloud(root, cloudTexture, pickTexture, rasterTexture, linearSampler, context, {
 			selectedColor,
 			bgColor
 		});

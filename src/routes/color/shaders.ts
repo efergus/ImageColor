@@ -327,7 +327,71 @@ export const cameraBindLayout = tgpu.bindGroupLayout({
 	cameraUniform: { uniform: cameraUniform },
 	weightTexture: { texture: d.texture3d() },
 	weightSampler: { sampler: 'filtering' },
+	rasterDepth: { texture: d.textureDepth2d() },
 });
+
+// Near/far planes for the rasterized scene's depth buffer. Shared by the
+// raster pass (encoding) and the cloud raymarch (decoding back to a distance).
+export const rasterNear = 0.05;
+export const rasterFar = 8.0;
+
+export const rasterLayout = tgpu.bindGroupLayout({
+	cameraUniform: { uniform: cameraUniform },
+});
+
+// Projects a world-space point with the exact same camera geometry as
+// cameraRay (tan(halfFov) = 0.6 vertically and 0.6 * aspect horizontally),
+// so rasterized geometry and raymarched volume line up pixel-for-pixel.
+// Depth uses the standard perspective mapping
+// depth = (far / (far - near)) * (1 - near / viewZ), which interpolates
+// correctly across triangles (linear in 1/viewZ).
+export const worldToClip = (p: d.v3f, yaw: number, pitch: number, radius: number, aspect: number) => {
+	'use gpu';
+	const center = d.vec3f(0.5, 0.5, 0.5);
+	const transform = cameraRotation(yaw, pitch);
+	const eye = eyeLocation(transform, radius, center);
+	const up = std.mul(transform, d.vec3f(0.0, 1.0, 0.0));
+	const fwd = std.normalize(std.sub(center, eye));
+	const right = std.normalize(std.cross(fwd, up));
+	const v = std.sub(p, eye);
+	const viewX = std.dot(v, right);
+	const viewY = std.dot(v, up);
+	const viewZ = std.dot(v, fwd);
+	const zClip = (viewZ - rasterNear) * (rasterFar / (rasterFar - rasterNear));
+	return d.vec4f(viewX / (aspect * 0.6), viewY / 0.6, zClip, viewZ);
+};
+
+export const rasterQuadVertex = ({ $vertexIndex: vid }: { $vertexIndex: number }) => {
+	'use gpu';
+	// A 1x1 vertical plane through the middle of the cloud's unit box.
+	const positions = [
+		d.vec3f(0.0, 0.0, 0.5),
+		d.vec3f(1.0, 0.0, 0.5),
+		d.vec3f(1.0, 1.0, 0.5),
+		d.vec3f(0.0, 0.0, 0.5),
+		d.vec3f(1.0, 1.0, 0.5),
+		d.vec3f(0.0, 1.0, 0.5),
+	];
+	const camera = rasterLayout.$.cameraUniform;
+	const worldPosition = positions[vid];
+	return {
+		$position: worldToClip(worldPosition, camera.yaw, camera.pitch, camera.radius, camera.aspect),
+		uv: d.vec2f(worldPosition.x, worldPosition.y)
+	};
+};
+
+export const rasterFragmentOutput = d.struct({
+	color: d.vec4f,
+});
+
+// uv is unused for now (the quad is solid black), but it is the hook for
+// texturing the plane with actual rasterized content later.
+export const rasterFragment = ({ uv: _uv }: { uv: d.v2f }): d.Infer<typeof rasterFragmentOutput> => {
+	'use gpu';
+	return {
+		color: d.vec4f(0.0, 0.0, 0.0, 1.0)
+	};
+};
 
 export const quadVertex = ({ $vertexIndex: vid }: { $vertexIndex: number }) => {
 	'use gpu';
@@ -370,7 +434,7 @@ export const triangleFragmentOutput = d.struct({
 	pick: d.vec4f,
 });
 
-export const triangleFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof triangleFragmentOutput> => {
+export const triangleFragment = ({ uv, $position: fragCoord }: { uv: d.v2f; $position: d.v4f }): d.Infer<typeof triangleFragmentOutput> => {
 	'use gpu';
 
 	const center = d.vec3f(0.5, 0.5, 0.5);
@@ -388,7 +452,23 @@ export const triangleFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof triangle
 	const intersection = boxIntersect(eye, direction);
 	// const intersection = sphereIntersect(std.sub(eye, center), direction, 1.0);
 	const min = std.max(0.0, intersection.x);
-	const max = intersection.y;
+	let max = intersection.y;
+
+	// The rasterized scene occludes the cloud: decode this pixel's depth-buffer
+	// value back into a distance along the ray and stop marching there.
+	// fragCoord is in framebuffer pixels, which matches the raster pass's
+	// depth texture texel-for-texel since both render at the same size.
+	const rasterDepth = textureLoad(
+		cameraBindLayout.$.rasterDepth,
+		d.vec2u(d.u32(fragCoord.x), d.u32(fragCoord.y)),
+		0
+	);
+	if (rasterDepth < 1.0) {
+		const viewZ = (rasterNear * rasterFar) / (rasterFar - rasterDepth * (rasterFar - rasterNear));
+		const fwd = std.normalize(std.sub(center, eye));
+		max = std.min(max, viewZ / std.dot(direction, fwd));
+	}
+
 	if (min >= max) {
 		return {
 			color: d.vec4f(0.0, 0.0, 0.0, 0.0),
@@ -446,6 +526,7 @@ export const cloudCompositeOptions = d.struct({
 export const cloudCompositeLayout = tgpu.bindGroupLayout({
 	cloudTexture: { texture: d.texture2d() },
 	pickTexture: { texture: d.texture2d() },
+	rasterTexture: { texture: d.texture2d() },
 	sampler: { sampler: 'filtering' },
 	options: { uniform: cloudCompositeOptions }
 });
@@ -454,6 +535,7 @@ export const cloudCompositeFragment = ({ uv }: { uv: d.v2f }) => {
 	'use gpu';
 	const cloud = textureSample(cloudCompositeLayout.$.cloudTexture, cloudCompositeLayout.$.sampler, uv);
 	const pick = textureSample(cloudCompositeLayout.$.pickTexture, cloudCompositeLayout.$.sampler, uv);
+	const raster = textureSample(cloudCompositeLayout.$.rasterTexture, cloudCompositeLayout.$.sampler, uv);
 
 	const targetDistance = cloudCompositeLayout.$.options.selectedColor.a;
 	const targetColorOklab = srgb_to_oklab(cloudCompositeLayout.$.options.selectedColor.rgb);
@@ -464,7 +546,10 @@ export const cloudCompositeFragment = ({ uv }: { uv: d.v2f }) => {
 
 	const bgLightness = cloudCompositeLayout.$.options.bgColor;
 	const bg = d.vec3f(bgLightness, bgLightness, bgLightness);
-	const outColor = std.mix(bg, cloud.rgb, d.f32(alpha));
+	// The ray was clamped at the rasterized surface, so the cloud only holds
+	// what lies in front of it: composite cloud over raster over background.
+	const base = std.mix(bg, raster.rgb, raster.a);
+	const outColor = std.mix(base, cloud.rgb, d.f32(alpha));
 	return d.vec4f(outColor, 1.0);
 };
 

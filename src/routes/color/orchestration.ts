@@ -1,6 +1,6 @@
 import { d, type StorageFlag, type TgpuBuffer, type TgpuFixedSampler, type TgpuQuerySet, type TgpuRenderPipeline, type TgpuRoot, type TgpuTexture } from "typegpu";
 import { once, onceBindGroup } from "../../lib/gpu/gpu_utils";
-import { computeOptions, filterBindLayout, filterFragment, filterOptions, quadVertex, textureRenderLayout, weightCalculation, weightCalculationLayout, processWeights, weightTransferLayout, weightTextureFormat, blur, weightProcessingLayout, imageFragment, triangleFragment, cameraBindLayout, cameraUniform, cloudCompositeFragment, cloudCompositeLayout, cloudCompositeOptions, colorSpaceSlot, linearRgbColorSpace, srgbColorSpace, oklabColorSpace, colorSpaceInverseSlot, linearRgbColorSpaceInverse, srgbColorSpaceInverse, oklabColorSpaceInverse, hsvColorSpace, hsvColorSpaceInverse, hslColorSpace, hslColorSpaceInverse } from "./shaders";
+import { computeOptions, filterBindLayout, filterFragment, filterOptions, quadVertex, textureRenderLayout, weightCalculation, weightCalculationLayout, processWeights, weightTransferLayout, weightTextureFormat, blur, weightProcessingLayout, imageFragment, triangleFragment, cameraBindLayout, cameraUniform, cloudCompositeFragment, cloudCompositeLayout, cloudCompositeOptions, colorSpaceSlot, linearRgbColorSpace, srgbColorSpace, oklabColorSpace, colorSpaceInverseSlot, linearRgbColorSpaceInverse, srgbColorSpaceInverse, oklabColorSpaceInverse, hsvColorSpace, hsvColorSpaceInverse, hslColorSpace, hslColorSpaceInverse, rasterLayout, rasterQuadVertex, rasterFragment } from "./shaders";
 import { textureDimensions } from "typegpu/std";
 import { ColorSpace } from "./color_utils";
 
@@ -250,7 +250,52 @@ export const colorSpacesConfig = {
     [ColorSpace.linear_rgb]: { label: 'Linear RGB', forward: linearRgbColorSpace, inverse: linearRgbColorSpaceInverse },
 };
 
-export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inputSampler: TgpuFixedSampler, outputView: any, pickView: any, colorSpace: ColorSpace, camera: d.Infer<typeof cameraUniform>) => {
+// Rasterizes the scene geometry (for now a single black quad through the
+// middle of the cloud) into a color texture and a depth buffer, using the
+// same camera as the cloud raymarch.
+export const renderRasterScene = (root: TgpuRoot, outputView: any, depthTexture: TgpuTexture, camera: d.Infer<typeof cameraUniform>) => {
+    const {
+        pipeline,
+        cameraBuffer
+    } = once(renderRasterScene, () => {
+        const pipeline = root
+            .createRenderPipeline({
+                primitive: { topology: 'triangle-list' },
+                vertex: rasterQuadVertex,
+                fragment: rasterFragment,
+                targets: {
+                    color: { format: 'rgba8unorm' }
+                },
+                depthStencil: {
+                    format: 'depth24plus',
+                    depthWriteEnabled: true,
+                    depthCompare: 'less'
+                }
+            }).withTimestampWrites(timestampOptions(root, 'renderRasterScene'));
+        const cameraBuffer = root.createBuffer(cameraUniform).$usage('uniform');
+        return { pipeline, cameraBuffer };
+    });
+
+    const bindGroup = onceBindGroup(root, rasterLayout, {
+        cameraUniform: cameraBuffer
+    });
+
+    cameraBuffer.write(camera);
+
+    pipeline.with(bindGroup)
+        .withColorAttachment({
+            color: { view: outputView }
+        })
+        .withDepthStencilAttachment({
+            view: depthTexture as any,
+            depthClearValue: 1.0,
+            depthLoadOp: 'clear',
+            depthStoreOp: 'store'
+        })
+        .draw(6);
+}
+
+export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inputSampler: TgpuFixedSampler, rasterDepthTexture: TgpuTexture, outputView: any, pickView: any, colorSpace: ColorSpace, camera: d.Infer<typeof cameraUniform>) => {
     const {
         pipeline,
         cameraBuffer
@@ -275,10 +320,15 @@ export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inpu
         return (inputTexture as any).createView('sampled');
     });
 
+    const rasterDepthView = once([renderColorCloud, rasterDepthTexture], () => {
+        return (rasterDepthTexture as any).createView(d.textureDepth2d());
+    });
+
     const cameraBindGroup = onceBindGroup(root, cameraBindLayout, {
         cameraUniform: cameraBuffer,
         weightTexture: inputTextureView,
-        weightSampler: inputSampler
+        weightSampler: inputSampler,
+        rasterDepth: rasterDepthView
     })
 
     cameraBuffer.write(camera);
@@ -290,7 +340,7 @@ export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inpu
         }).draw(6);
 }
 
-export const compositeColorCloud = (root: TgpuRoot, cloudTexture: TgpuTexture, pickTexture: TgpuTexture, inputSampler: TgpuFixedSampler, outputView: any, options: d.Infer<typeof cloudCompositeOptions>) => {
+export const compositeColorCloud = (root: TgpuRoot, cloudTexture: TgpuTexture, pickTexture: TgpuTexture, rasterTexture: TgpuTexture, inputSampler: TgpuFixedSampler, outputView: any, options: d.Infer<typeof cloudCompositeOptions>) => {
     const {
         pipeline,
         optionsBuffer
@@ -313,9 +363,14 @@ export const compositeColorCloud = (root: TgpuRoot, cloudTexture: TgpuTexture, p
         return (pickTexture as any).createView('sampled');
     });
 
+    const rasterTextureView = once([compositeColorCloud, rasterTexture], () => {
+        return (rasterTexture as any).createView('sampled');
+    });
+
     const bindGroup = onceBindGroup(root, cloudCompositeLayout, {
         cloudTexture: cloudTextureView,
         pickTexture: pickTextureView,
+        rasterTexture: rasterTextureView,
         sampler: inputSampler,
         options: optionsBuffer
     });
