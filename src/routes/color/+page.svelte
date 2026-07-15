@@ -17,12 +17,8 @@
 		type StorageFlag,
 		type TgpuBuffer,
 		type TgpuFixedSampler,
-		type TgpuGuardedComputePipeline,
-		type TgpuQuerySet,
-		type TgpuRenderPipeline,
 		type TgpuRoot,
-		type TgpuTexture,
-		type UniformFlag
+		type TgpuTexture
 	} from 'typegpu';
 	import * as d from 'typegpu/data';
 	import beeCloseImg from '$lib/assets/bee_close.jpg';
@@ -35,18 +31,10 @@
 		{ name: 'Pastels', src: pastelsImg }
 	];
 
-	const tableSizes = [
-		{ value: '16', label: '16' },
-		{ value: '32', label: '32' },
-		{ value: '64', label: '64' },
-		{ value: '128', label: '128' }
-	];
-
 	import {
 		calculateWeights,
 		filterTexture,
 		processWeightTexture,
-		blurWeightTexture,
 		renderImage,
 		renderRasterScene,
 		renderColorCloud,
@@ -55,7 +43,7 @@
 		colorSpacesConfig
 	} from './orchestration';
 	import { once } from '$lib/gpu/gpu_utils';
-	import { ColorSpace, oklab_to_srgb, srgb_to_oklab } from './color_utils';
+	import { ColorSpace, srgb_to_oklab } from './color_utils';
 
 	const colorSpaces = Object.entries(colorSpacesConfig).map(([value, config]) => ({
 		value: value as ColorSpace,
@@ -73,14 +61,12 @@
 	let yaw = $state(0.4);
 	let pitch = $state(0.2);
 	let radius = $state(1);
-	let steps = $state(24);
 	let sensitivitySlider = $state(3.0);
 	let sensitivity = $derived(sensitivitySlider === 6 ? 0 : Math.pow(10, 3 - sensitivitySlider));
 	let bgColor = $state(0.2);
 	let saturation = $state(1.0);
 	let contrast = $state(1.0);
 	let tableSize = $state(128);
-	let tableSizeStr = $state('128');
 	let colorSpace = $state(ColorSpace.oklab);
 	let color = $state('rgba(0, 0, 0, 1)');
 	let isHovering = $state(false);
@@ -96,11 +82,11 @@
 		context: GPUCanvasContext;
 		imageContext: GPUCanvasContext;
 		imageBitmap: ImageBitmap;
-		imageTexture: TgpuTexture & StorageFlag & SampledFlag;
-		filteredTexture: TgpuTexture & RenderFlag & SampledFlag;
+		imageTexture: TgpuTexture & RenderFlag & StorageFlag & SampledFlag;
+		filteredTexture: TgpuTexture & RenderFlag & StorageFlag & SampledFlag;
 		pickStagingBuffer: TgpuBuffer<d.WgslArray<d.U32>>;
 		linearSampler: TgpuFixedSampler;
-		blurredWeightTexture: any;
+		blurredWeightTexture: ReturnType<typeof processWeightTexture> | null;
 	} | null = null;
 
 	let isReadingBack = false;
@@ -365,6 +351,11 @@
 		const { root, linearSampler, context, imageContext, filteredTexture, blurredWeightTexture } =
 			gpuState;
 
+		if (!blurredWeightTexture) {
+			requestAnimationFrame(() => renderScene());
+			return;
+		}
+
 		const selectedColor = isHovering
 			? d.vec4f(hoveredRGB.x, hoveredRGB.y, hoveredRGB.z, 0.05)
 			: d.vec4f(0.0, 0.0, 0.0, 1000.0);
@@ -396,17 +387,14 @@
 				steps,
 				sensitivity
 			};
-			const pickView = (pickTexture as any).createView('render');
-			const cloudView = (cloudTexture as any).createView('render');
-			const rasterView = (rasterTexture as any).createView('render');
-			renderRasterScene(root, rasterView, rasterDepthTexture, camera);
+			renderRasterScene(root, rasterTexture, rasterDepthTexture, camera);
 			renderColorCloud(
 				root,
 				blurredWeightTexture,
 				linearSampler,
 				rasterDepthTexture,
-				cloudView,
-				pickView,
+				cloudTexture,
+				pickTexture,
 				colorSpace,
 				camera
 			);
@@ -516,16 +504,6 @@
 		filterUpdated = now;
 		cloudUpdated = now;
 		updated = now;
-	};
-
-	const onTableSizeChange = (v: string) => {
-		tableSizeStr = v;
-		tableSize = parseInt(v);
-		if (gpuState) {
-			invalidateCaches();
-			computeWeightTexture(tableSize);
-			onCloudUpdate();
-		}
 	};
 </script>
 
@@ -671,7 +649,7 @@
 				</label>
 				<div class="presets">
 					<span class="preset-label">Presets:</span>
-					{#each presets as preset}
+					{#each presets as preset (preset.name)}
 						<button class="btn preset-btn" onclick={() => loadPreset(preset)}>{preset.name}</button>
 					{/each}
 				</div>

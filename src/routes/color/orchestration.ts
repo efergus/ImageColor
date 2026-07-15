@@ -1,383 +1,498 @@
-import { d, type StorageFlag, type TgpuBuffer, type TgpuFixedSampler, type TgpuQuerySet, type TgpuRenderPipeline, type TgpuRoot, type TgpuTexture } from "typegpu";
-import { once, onceBindGroup } from "../../lib/gpu/gpu_utils";
-import { computeOptions, filterBindLayout, filterFragment, filterOptions, quadVertex, textureRenderLayout, weightCalculation, weightCalculationLayout, processWeights, weightTransferLayout, weightTextureFormat, blur, weightProcessingLayout, imageFragment, triangleFragment, cameraBindLayout, cameraUniform, cloudCompositeFragment, cloudCompositeLayout, cloudCompositeOptions, colorSpaceSlot, linearRgbColorSpace, srgbColorSpace, oklabColorSpace, colorSpaceInverseSlot, linearRgbColorSpaceInverse, srgbColorSpaceInverse, oklabColorSpaceInverse, hsvColorSpace, hsvColorSpaceInverse, hslColorSpace, hslColorSpaceInverse, rasterLayout, rasterQuadVertex, rasterFragment } from "./shaders";
-import { textureDimensions } from "typegpu/std";
-import { ColorSpace } from "./color_utils";
+import {
+	d,
+	type RenderFlag,
+	type SampledFlag,
+	type StorageFlag,
+	type TgpuBuffer,
+	type TgpuFixedSampler,
+	type TgpuQuerySet,
+	type TgpuRoot,
+	type TgpuTexture
+} from 'typegpu';
+import { once, onceBindGroup } from '../../lib/gpu/gpu_utils';
+import {
+	computeOptions,
+	filterBindLayout,
+	filterFragment,
+	filterOptions,
+	quadVertex,
+	textureRenderLayout,
+	weightCalculation,
+	weightCalculationLayout,
+	processWeights,
+	weightTransferLayout,
+	weightTextureFormat,
+	blur,
+	weightProcessingLayout,
+	imageFragment,
+	triangleFragment,
+	cameraBindLayout,
+	cameraUniform,
+	cloudCompositeFragment,
+	cloudCompositeLayout,
+	cloudCompositeOptions,
+	colorSpaceSlot,
+	linearRgbColorSpace,
+	srgbColorSpace,
+	oklabColorSpace,
+	colorSpaceInverseSlot,
+	linearRgbColorSpaceInverse,
+	srgbColorSpaceInverse,
+	oklabColorSpaceInverse,
+	hsvColorSpace,
+	hsvColorSpaceInverse,
+	hslColorSpace,
+	hslColorSpaceInverse,
+	rasterLayout,
+	rasterQuadVertex,
+	rasterFragment
+} from './shaders';
+import { ColorSpace } from './color_utils';
+
+// A render pass output: either a texture to draw into or a canvas context.
+type RenderTarget = (TgpuTexture & RenderFlag) | GPUCanvasContext;
+
+// TgpuTexture's default props assume a 2d texture, so 3d textures need their
+// dimension spelled out for typegpu to accept 3d views of them.
+type Texture3d = TgpuTexture<{
+	size: readonly number[];
+	format: GPUTextureFormat;
+	dimension: '3d';
+	sampleCount?: 1 | undefined;
+}>;
 
 let querySet: TgpuQuerySet<'timestamp'> | null = null;
-let querySetNames: Map<string, number> = new Map()
+const querySetNames: Map<string, number> = new Map();
 
 const timestampOptions = (root: TgpuRoot, name: string) => {
-    if (querySet === null) {
-        querySet = root.createQuerySet('timestamp', 64);
-    }
+	if (querySet === null) {
+		querySet = root.createQuerySet('timestamp', 64);
+	}
 
-    let index = querySetNames.get(name);
-    if (index === undefined) {
-        index = querySetNames.size;
-        if (index >= 32) {
-            console.error(`Too many pipelines! Could not time ${name}`);
-        }
-        querySetNames.set(name, index);
-    }
-    return {
-        querySet,
-        beginningOfPassWriteIndex: index * 2,
-        endOfPassWriteIndex: index * 2 + 1
-    }
-}
+	let index = querySetNames.get(name);
+	if (index === undefined) {
+		index = querySetNames.size;
+		if (index >= 32) {
+			console.error(`Too many pipelines! Could not time ${name}`);
+		}
+		querySetNames.set(name, index);
+	}
+	return {
+		querySet,
+		beginningOfPassWriteIndex: index * 2,
+		endOfPassWriteIndex: index * 2 + 1
+	};
+};
 
-let querySetTimings: Map<string, number[]> = new Map();
+const querySetTimings: Map<string, number[]> = new Map();
 
 export const readTimings = async () => {
-    if (!querySet) {
-        console.warn('Query set not available')
-        return;
-    }
-    if (querySet.available) {
-        querySet.resolve();
-        const values = await querySet.read();
-        for (const name of querySetNames.keys()) {
-            const index = querySetNames.get(name)! * 2;
+	if (!querySet) {
+		console.warn('Query set not available');
+		return;
+	}
+	if (querySet.available) {
+		querySet.resolve();
+		const values = await querySet.read();
+		for (const name of querySetNames.keys()) {
+			const index = querySetNames.get(name)! * 2;
 
-            const start = values[index];
-            const end = values[index + 1];
-            const time = Number(end - start);
-            const past = querySetTimings.get(name) ?? [];
-            if (past.length && past[past.length - 1] === time) {
-                continue;
-            }
+			const start = values[index];
+			const end = values[index + 1];
+			const time = Number(end - start);
+			const past = querySetTimings.get(name) ?? [];
+			if (past.length && past[past.length - 1] === time) {
+				continue;
+			}
 
-            past.push(time);
-            querySetTimings.set(name, past);
-            console.log(`Pass ${name}: ${time / 1e6} ms`);
-        }
-    } else {
-        console.warn('querySet not available');
-    }
-}
+			past.push(time);
+			querySetTimings.set(name, past);
+			console.log(`Pass ${name}: ${time / 1e6} ms`);
+		}
+	} else {
+		console.warn('querySet not available');
+	}
+};
 
-export const filterTexture = (root: TgpuRoot, inputTexture: TgpuTexture, inputSampler: TgpuFixedSampler, options: d.Infer<typeof filterOptions>) => {
-    const format = 'rgba16float';
+export const filterTexture = (
+	root: TgpuRoot,
+	inputTexture: TgpuTexture & SampledFlag,
+	inputSampler: TgpuFixedSampler,
+	options: d.Infer<typeof filterOptions>
+) => {
+	const format = 'rgba16float';
 
-    const {
-        optionsBuffer,
-        pipeline
-    } = once(filterTexture, () => {
-        const pipeline = root.createRenderPipeline({
-            primitive: { topology: 'triangle-list' },
-            vertex: quadVertex,
-            fragment: filterFragment,
-            targets: {
-                color: { format }
-            }
-        }).withTimestampWrites(timestampOptions(root, 'filterTexture'));
-        const optionsBuffer = root.createBuffer(filterOptions).$usage('uniform');
-        return { optionsBuffer, pipeline }
-    })
+	const { optionsBuffer, pipeline } = once(filterTexture, () => {
+		const pipeline = root
+			.createRenderPipeline({
+				primitive: { topology: 'triangle-list' },
+				vertex: quadVertex,
+				fragment: filterFragment,
+				targets: {
+					color: { format }
+				}
+			})
+			.withTimestampWrites(timestampOptions(root, 'filterTexture'));
+		const optionsBuffer = root.createBuffer(filterOptions).$usage('uniform');
+		return { optionsBuffer, pipeline };
+	});
 
-    const { outputTexture, outputView } = once([filterTexture, options.textureSize.x, options.textureSize.y], () => {
-        const outputTexture = root.createTexture({
-            size: [options.textureSize.x, options.textureSize.y],
-            format,
-        }).$usage('render', 'sampled', 'storage');
-        const outputView = outputTexture.createView('render');
-        return { outputTexture, outputView }
-    })
+	const { outputTexture, outputView } = once(
+		[filterTexture, options.textureSize.x, options.textureSize.y],
+		() => {
+			const outputTexture = root
+				.createTexture({
+					size: [options.textureSize.x, options.textureSize.y],
+					format
+				})
+				.$usage('render', 'sampled', 'storage');
+			const outputView = outputTexture.createView('render');
+			return { outputTexture, outputView };
+		}
+	);
 
-    optionsBuffer.write(options);
+	optionsBuffer.write(options);
 
-    const filterBindGroup = onceBindGroup(root, filterBindLayout, {
-        texture: inputTexture as any,
-        sampler: inputSampler,
-        filterOptions: optionsBuffer
-    })
+	const inputTextureView = once([filterTexture, inputTexture], () => {
+		return inputTexture.createView(d.texture2d());
+	});
 
-    pipeline.with(filterBindGroup).withColorAttachment({
-        color: { view: outputView }
-    }).draw(6);
+	const filterBindGroup = onceBindGroup(root, filterBindLayout, {
+		texture: inputTextureView,
+		sampler: inputSampler,
+		filterOptions: optionsBuffer
+	});
 
-    return outputTexture;
-}
+	pipeline
+		.with(filterBindGroup)
+		.withColorAttachment({
+			color: { view: outputView }
+		})
+		.draw(6);
 
-export const calculateWeights = (root: TgpuRoot, inputTexture: TgpuTexture, colorSpace: ColorSpace, options: d.Infer<typeof computeOptions>) => {
-    const {
-        pipeline,
-        optionsBuffer,
-    } = once([calculateWeights, colorSpace], () => {
-        const pipeline = root
-            .with(colorSpaceSlot, colorSpacesConfig[colorSpace].forward)
-            .createGuardedComputePipeline(weightCalculation)
-            .withTimestampWrites(timestampOptions(root, 'calculateWeights'))
-        const optionsBuffer = root.createBuffer(computeOptions).$usage('uniform');
-        return { pipeline, optionsBuffer };
-    });
+	return outputTexture;
+};
 
-    const {
-        outputBuffer
-    } = once([calculateWeights, options.tableSize], () => {
-        const outputBuffer = root
-            .createBuffer(d.arrayOf(d.u32, options.tableSize * options.tableSize * options.tableSize * 4))
-            .$usage('storage');
-        return { outputBuffer }
-    })
+export const calculateWeights = (
+	root: TgpuRoot,
+	inputTexture: TgpuTexture & StorageFlag,
+	colorSpace: ColorSpace,
+	options: d.Infer<typeof computeOptions>
+) => {
+	const { pipeline, optionsBuffer } = once([calculateWeights, colorSpace], () => {
+		const pipeline = root
+			.with(colorSpaceSlot, colorSpacesConfig[colorSpace].forward)
+			.createGuardedComputePipeline(weightCalculation)
+			.withTimestampWrites(timestampOptions(root, 'calculateWeights'));
+		const optionsBuffer = root.createBuffer(computeOptions).$usage('uniform');
+		return { pipeline, optionsBuffer };
+	});
 
-    optionsBuffer.write(options);
-    outputBuffer.clear();
+	const { outputBuffer } = once([calculateWeights, options.tableSize], () => {
+		const outputBuffer = root
+			.createBuffer(d.arrayOf(d.u32, options.tableSize * options.tableSize * options.tableSize * 4))
+			.$usage('storage');
+		return { outputBuffer };
+	});
 
-    const bindGroup = onceBindGroup(root, weightCalculationLayout, {
-        image: (inputTexture as any),
-        weights: outputBuffer,
-        options: optionsBuffer
-    });
+	optionsBuffer.write(options);
+	outputBuffer.clear();
 
-    pipeline.with(bindGroup).dispatchThreads(options.textureSize.x, options.textureSize.y);
+	const inputTextureView = once([calculateWeights, inputTexture], () => {
+		return inputTexture.createView(d.textureStorage2d(weightTextureFormat, 'read-only'));
+	});
 
-    return outputBuffer;
-}
+	const bindGroup = onceBindGroup(root, weightCalculationLayout, {
+		image: inputTextureView,
+		weights: outputBuffer,
+		options: optionsBuffer
+	});
 
-export const processWeightTexture = (root: TgpuRoot, weightsBuffer: TgpuBuffer<d.WgslArray<d.U32>> & StorageFlag, options: d.Infer<typeof computeOptions>) => {
-    const {
-        pipeline,
-        optionsBuffer,
-    } = once(processWeightTexture, () => {
-        const pipeline = root.createGuardedComputePipeline(processWeights).withTimestampWrites(timestampOptions(root, 'processWeightTexture'));
-        const optionsBuffer = root.createBuffer(computeOptions).$usage('uniform');
-        return { pipeline, optionsBuffer };
-    });
+	pipeline.with(bindGroup).dispatchThreads(options.textureSize.x, options.textureSize.y);
 
-    const {
-        outputTexture
-    } = once([processWeightTexture, options.tableSize], () => {
-        const outputTexture = root.createTexture({
-            size: [options.tableSize, options.tableSize, options.tableSize],
-            format: weightTextureFormat,
-            dimension: '3d'
-        }).$usage('render', 'sampled', 'storage');
-        return { outputTexture }
-    });
+	return outputBuffer;
+};
 
-    optionsBuffer.write(options);
+export const processWeightTexture = (
+	root: TgpuRoot,
+	weightsBuffer: TgpuBuffer<d.WgslArray<d.U32>> & StorageFlag,
+	options: d.Infer<typeof computeOptions>
+) => {
+	const { pipeline, optionsBuffer } = once(processWeightTexture, () => {
+		const pipeline = root
+			.createGuardedComputePipeline(processWeights)
+			.withTimestampWrites(timestampOptions(root, 'processWeightTexture'));
+		const optionsBuffer = root.createBuffer(computeOptions).$usage('uniform');
+		return { pipeline, optionsBuffer };
+	});
 
-    const bindGroup = onceBindGroup(root, weightTransferLayout, {
-        options: optionsBuffer,
-        weights: weightsBuffer,
-        outputTexture: outputTexture
-    });
+	const { outputTexture } = once([processWeightTexture, options.tableSize], () => {
+		const outputTexture = root
+			.createTexture({
+				size: [options.tableSize, options.tableSize, options.tableSize],
+				format: weightTextureFormat,
+				dimension: '3d'
+			})
+			.$usage('render', 'sampled', 'storage');
+		return { outputTexture };
+	});
 
-    pipeline.with(bindGroup).dispatchThreads(options.tableSize, options.tableSize, options.tableSize);
+	optionsBuffer.write(options);
 
-    return outputTexture;
-}
+	const bindGroup = onceBindGroup(root, weightTransferLayout, {
+		options: optionsBuffer,
+		weights: weightsBuffer,
+		outputTexture: outputTexture
+	});
 
-export const blurWeightTexture = (root: TgpuRoot, inputTexture: TgpuTexture, options: d.Infer<typeof filterOptions>, tableSize: number) => {
-    const {
-        pipeline,
-        optionsBuffer,
-    } = once(blurWeightTexture, () => {
-        const pipeline = root.createGuardedComputePipeline(blur).withTimestampWrites(timestampOptions(root, 'blurWeightTexture'));
-        const optionsBuffer = root.createBuffer(filterOptions).$usage('uniform');
-        return { pipeline, optionsBuffer };
-    });
+	pipeline.with(bindGroup).dispatchThreads(options.tableSize, options.tableSize, options.tableSize);
 
-    const {
-        outputTexture
-    } = once([blurWeightTexture, tableSize], () => {
-        const outputTexture = root.createTexture({
-            size: [tableSize, tableSize, tableSize],
-            format: weightTextureFormat,
-            dimension: '3d'
-        }).$usage('sampled', 'storage');
-        return { outputTexture }
-    });
+	return outputTexture;
+};
 
-    optionsBuffer.write(options);
+export const blurWeightTexture = (
+	root: TgpuRoot,
+	inputTexture: Texture3d & SampledFlag,
+	options: d.Infer<typeof filterOptions>,
+	tableSize: number
+) => {
+	const { pipeline, optionsBuffer } = once(blurWeightTexture, () => {
+		const pipeline = root
+			.createGuardedComputePipeline(blur)
+			.withTimestampWrites(timestampOptions(root, 'blurWeightTexture'));
+		const optionsBuffer = root.createBuffer(filterOptions).$usage('uniform');
+		return { pipeline, optionsBuffer };
+	});
 
-    const inputTextureView = once([blurWeightTexture, inputTexture], () => {
-        return (inputTexture as any).createView('sampled');
-    });
+	const { outputTexture } = once([blurWeightTexture, tableSize], () => {
+		const outputTexture = root
+			.createTexture({
+				size: [tableSize, tableSize, tableSize],
+				format: weightTextureFormat,
+				dimension: '3d'
+			})
+			.$usage('sampled', 'storage');
+		return { outputTexture };
+	});
 
-    const bindGroup = onceBindGroup(root, weightProcessingLayout, {
-        options: optionsBuffer,
-        inputTexture: inputTextureView,
-        outputTexture: outputTexture as any
-    });
+	optionsBuffer.write(options);
 
-    pipeline.with(bindGroup).dispatchThreads(tableSize, tableSize, tableSize);
+	const inputTextureView = once([blurWeightTexture, inputTexture], () => {
+		return inputTexture.createView(d.texture3d());
+	});
 
-    return outputTexture;
-}
+	const bindGroup = onceBindGroup(root, weightProcessingLayout, {
+		options: optionsBuffer,
+		inputTexture: inputTextureView,
+		outputTexture: outputTexture.createView(d.textureStorage3d(weightTextureFormat, 'write-only'))
+	});
 
-export const renderImage = (root: TgpuRoot, inputTexture: TgpuTexture, inputSampler: TgpuFixedSampler, outputView: any, options: d.Infer<typeof filterOptions>) => {
-    const {
-        pipeline,
-        optionsBuffer
-    } = once(renderImage, () => {
-        const pipeline = root
-            .createRenderPipeline({
-                primitive: { topology: 'triangle-list' },
-                vertex: quadVertex,
-                fragment: imageFragment
-            }).withTimestampWrites(timestampOptions(root, 'renderImage'));
-        const optionsBuffer = root.createBuffer(filterOptions).$usage('uniform');
-        return { pipeline, optionsBuffer };
-    });
+	pipeline.with(bindGroup).dispatchThreads(tableSize, tableSize, tableSize);
 
-    const inputTextureView = once([renderImage, inputTexture], () => {
-        return (inputTexture as any).createView('sampled');
-    });
+	return outputTexture;
+};
 
-    const bindGroup = onceBindGroup(root, textureRenderLayout, {
-        texture: inputTextureView,
-        sampler: inputSampler,
-        options: optionsBuffer
-    });
+export const renderImage = (
+	root: TgpuRoot,
+	inputTexture: TgpuTexture & SampledFlag,
+	inputSampler: TgpuFixedSampler,
+	outputView: RenderTarget,
+	options: d.Infer<typeof filterOptions>
+) => {
+	const { pipeline, optionsBuffer } = once(renderImage, () => {
+		const pipeline = root
+			.createRenderPipeline({
+				primitive: { topology: 'triangle-list' },
+				vertex: quadVertex,
+				fragment: imageFragment
+			})
+			.withTimestampWrites(timestampOptions(root, 'renderImage'));
+		const optionsBuffer = root.createBuffer(filterOptions).$usage('uniform');
+		return { pipeline, optionsBuffer };
+	});
 
-    optionsBuffer.write(options);
+	const inputTextureView = once([renderImage, inputTexture], () => {
+		return inputTexture.createView(d.texture2d());
+	});
 
-    pipeline.with(bindGroup).withColorAttachment({
-        view: outputView
-    }).draw(6);
-}
+	const bindGroup = onceBindGroup(root, textureRenderLayout, {
+		texture: inputTextureView,
+		sampler: inputSampler,
+		options: optionsBuffer
+	});
 
+	optionsBuffer.write(options);
 
+	pipeline
+		.with(bindGroup)
+		.withColorAttachment({
+			view: outputView
+		})
+		.draw(6);
+};
 
 export const colorSpacesConfig = {
-    [ColorSpace.oklab]: { label: 'Oklab', forward: oklabColorSpace, inverse: oklabColorSpaceInverse },
-    [ColorSpace.hsv]: { label: 'HSV', forward: hsvColorSpace, inverse: hsvColorSpaceInverse },
-    [ColorSpace.hsl]: { label: 'HSL', forward: hslColorSpace, inverse: hslColorSpaceInverse },
-    [ColorSpace.srgb]: { label: 'sRGB', forward: srgbColorSpace, inverse: srgbColorSpaceInverse },
-    [ColorSpace.linear_rgb]: { label: 'Linear RGB', forward: linearRgbColorSpace, inverse: linearRgbColorSpaceInverse },
+	[ColorSpace.oklab]: { label: 'Oklab', forward: oklabColorSpace, inverse: oklabColorSpaceInverse },
+	[ColorSpace.hsv]: { label: 'HSV', forward: hsvColorSpace, inverse: hsvColorSpaceInverse },
+	[ColorSpace.hsl]: { label: 'HSL', forward: hslColorSpace, inverse: hslColorSpaceInverse },
+	[ColorSpace.srgb]: { label: 'sRGB', forward: srgbColorSpace, inverse: srgbColorSpaceInverse },
+	[ColorSpace.linear_rgb]: {
+		label: 'Linear RGB',
+		forward: linearRgbColorSpace,
+		inverse: linearRgbColorSpaceInverse
+	}
 };
 
 // Rasterizes the scene geometry (for now a single black quad through the
 // middle of the cloud) into a color texture and a depth buffer, using the
 // same camera as the cloud raymarch.
-export const renderRasterScene = (root: TgpuRoot, outputView: any, depthTexture: TgpuTexture, camera: d.Infer<typeof cameraUniform>) => {
-    const {
-        pipeline,
-        cameraBuffer
-    } = once(renderRasterScene, () => {
-        const pipeline = root
-            .createRenderPipeline({
-                primitive: { topology: 'triangle-list' },
-                vertex: rasterQuadVertex,
-                fragment: rasterFragment,
-                targets: {
-                    color: { format: 'rgba8unorm' }
-                },
-                depthStencil: {
-                    format: 'depth24plus',
-                    depthWriteEnabled: true,
-                    depthCompare: 'less'
-                }
-            }).withTimestampWrites(timestampOptions(root, 'renderRasterScene'));
-        const cameraBuffer = root.createBuffer(cameraUniform).$usage('uniform');
-        return { pipeline, cameraBuffer };
-    });
+export const renderRasterScene = (
+	root: TgpuRoot,
+	outputTexture: TgpuTexture & RenderFlag,
+	depthTexture: TgpuTexture & RenderFlag & SampledFlag,
+	camera: d.Infer<typeof cameraUniform>
+) => {
+	const { pipeline, cameraBuffer } = once(renderRasterScene, () => {
+		const pipeline = root
+			.createRenderPipeline({
+				primitive: { topology: 'triangle-list' },
+				vertex: rasterQuadVertex,
+				fragment: rasterFragment,
+				targets: {
+					color: { format: 'rgba8unorm' }
+				},
+				depthStencil: {
+					format: 'depth24plus',
+					depthWriteEnabled: true,
+					depthCompare: 'less'
+				}
+			})
+			.withTimestampWrites(timestampOptions(root, 'renderRasterScene'));
+		const cameraBuffer = root.createBuffer(cameraUniform).$usage('uniform');
+		return { pipeline, cameraBuffer };
+	});
 
-    const bindGroup = onceBindGroup(root, rasterLayout, {
-        cameraUniform: cameraBuffer
-    });
+	const bindGroup = onceBindGroup(root, rasterLayout, {
+		cameraUniform: cameraBuffer
+	});
 
-    cameraBuffer.write(camera);
+	cameraBuffer.write(camera);
 
-    pipeline.with(bindGroup)
-        .withColorAttachment({
-            color: { view: outputView }
-        })
-        .withDepthStencilAttachment({
-            view: depthTexture as any,
-            depthClearValue: 1.0,
-            depthLoadOp: 'clear',
-            depthStoreOp: 'store'
-        })
-        .draw(6);
-}
+	pipeline
+		.with(bindGroup)
+		.withColorAttachment({
+			color: { view: outputTexture }
+		})
+		.withDepthStencilAttachment({
+			view: depthTexture,
+			depthClearValue: 1.0,
+			depthLoadOp: 'clear',
+			depthStoreOp: 'store'
+		})
+		.draw(6);
+};
 
-export const renderColorCloud = (root: TgpuRoot, inputTexture: TgpuTexture, inputSampler: TgpuFixedSampler, rasterDepthTexture: TgpuTexture, outputView: any, pickView: any, colorSpace: ColorSpace, camera: d.Infer<typeof cameraUniform>) => {
-    const {
-        pipeline,
-        cameraBuffer
-    } = once([renderColorCloud, colorSpace], () => {
-        const pipeline = root
-            .with(colorSpaceSlot, colorSpacesConfig[colorSpace].forward)
-            .with(colorSpaceInverseSlot, colorSpacesConfig[colorSpace].inverse)
-            .createRenderPipeline({
-                primitive: { topology: 'triangle-list' },
-                vertex: quadVertex,
-                fragment: triangleFragment,
-                targets: {
-                    color: { format: 'rgba8unorm' },
-                    pick: { format: 'rgba8unorm' }
-                }
-            }).withTimestampWrites(timestampOptions(root, 'renderColorCloud'));
-        const cameraBuffer = root.createBuffer(cameraUniform).$usage('uniform');
-        return { pipeline, cameraBuffer };
-    });
+export const renderColorCloud = (
+	root: TgpuRoot,
+	inputTexture: Texture3d & SampledFlag,
+	inputSampler: TgpuFixedSampler,
+	rasterDepthTexture: TgpuTexture & SampledFlag,
+	outputTexture: TgpuTexture & RenderFlag,
+	pickTexture: TgpuTexture & RenderFlag,
+	colorSpace: ColorSpace,
+	camera: d.Infer<typeof cameraUniform>
+) => {
+	const { pipeline, cameraBuffer } = once([renderColorCloud, colorSpace], () => {
+		const pipeline = root
+			.with(colorSpaceSlot, colorSpacesConfig[colorSpace].forward)
+			.with(colorSpaceInverseSlot, colorSpacesConfig[colorSpace].inverse)
+			.createRenderPipeline({
+				primitive: { topology: 'triangle-list' },
+				vertex: quadVertex,
+				fragment: triangleFragment,
+				targets: {
+					color: { format: 'rgba8unorm' },
+					pick: { format: 'rgba8unorm' }
+				}
+			})
+			.withTimestampWrites(timestampOptions(root, 'renderColorCloud'));
+		const cameraBuffer = root.createBuffer(cameraUniform).$usage('uniform');
+		return { pipeline, cameraBuffer };
+	});
 
-    const inputTextureView = once([renderColorCloud, inputTexture], () => {
-        return (inputTexture as any).createView('sampled');
-    });
+	const inputTextureView = once([renderColorCloud, inputTexture], () => {
+		return inputTexture.createView(d.texture3d());
+	});
 
-    const rasterDepthView = once([renderColorCloud, rasterDepthTexture], () => {
-        return (rasterDepthTexture as any).createView(d.textureDepth2d());
-    });
+	const rasterDepthView = once([renderColorCloud, rasterDepthTexture], () => {
+		return rasterDepthTexture.createView(d.textureDepth2d());
+	});
 
-    const cameraBindGroup = onceBindGroup(root, cameraBindLayout, {
-        cameraUniform: cameraBuffer,
-        weightTexture: inputTextureView,
-        weightSampler: inputSampler,
-        rasterDepth: rasterDepthView
-    })
+	const cameraBindGroup = onceBindGroup(root, cameraBindLayout, {
+		cameraUniform: cameraBuffer,
+		weightTexture: inputTextureView,
+		weightSampler: inputSampler,
+		rasterDepth: rasterDepthView
+	});
 
-    cameraBuffer.write(camera);
+	cameraBuffer.write(camera);
 
-    pipeline.with(cameraBindGroup)
-        .withColorAttachment({
-            color: { view: outputView },
-            pick: { view: pickView }
-        }).draw(6);
-}
+	pipeline
+		.with(cameraBindGroup)
+		.withColorAttachment({
+			color: { view: outputTexture },
+			pick: { view: pickTexture }
+		})
+		.draw(6);
+};
 
-export const compositeColorCloud = (root: TgpuRoot, cloudTexture: TgpuTexture, pickTexture: TgpuTexture, rasterTexture: TgpuTexture, inputSampler: TgpuFixedSampler, outputView: any, options: d.Infer<typeof cloudCompositeOptions>) => {
-    const {
-        pipeline,
-        optionsBuffer
-    } = once(compositeColorCloud, () => {
-        const pipeline = root
-            .createRenderPipeline({
-                primitive: { topology: 'triangle-list' },
-                vertex: quadVertex,
-                fragment: cloudCompositeFragment
-            }).withTimestampWrites(timestampOptions(root, 'compositeColorCloud'));
-        const optionsBuffer = root.createBuffer(cloudCompositeOptions).$usage('uniform');
-        return { pipeline, optionsBuffer };
-    });
+export const compositeColorCloud = (
+	root: TgpuRoot,
+	cloudTexture: TgpuTexture & SampledFlag,
+	pickTexture: TgpuTexture & SampledFlag,
+	rasterTexture: TgpuTexture & SampledFlag,
+	inputSampler: TgpuFixedSampler,
+	outputView: RenderTarget,
+	options: d.Infer<typeof cloudCompositeOptions>
+) => {
+	const { pipeline, optionsBuffer } = once(compositeColorCloud, () => {
+		const pipeline = root
+			.createRenderPipeline({
+				primitive: { topology: 'triangle-list' },
+				vertex: quadVertex,
+				fragment: cloudCompositeFragment
+			})
+			.withTimestampWrites(timestampOptions(root, 'compositeColorCloud'));
+		const optionsBuffer = root.createBuffer(cloudCompositeOptions).$usage('uniform');
+		return { pipeline, optionsBuffer };
+	});
 
-    const cloudTextureView = once([compositeColorCloud, cloudTexture], () => {
-        return (cloudTexture as any).createView('sampled');
-    });
+	const cloudTextureView = once([compositeColorCloud, cloudTexture], () => {
+		return cloudTexture.createView(d.texture2d());
+	});
 
-    const pickTextureView = once([compositeColorCloud, pickTexture], () => {
-        return (pickTexture as any).createView('sampled');
-    });
+	const pickTextureView = once([compositeColorCloud, pickTexture], () => {
+		return pickTexture.createView(d.texture2d());
+	});
 
-    const rasterTextureView = once([compositeColorCloud, rasterTexture], () => {
-        return (rasterTexture as any).createView('sampled');
-    });
+	const rasterTextureView = once([compositeColorCloud, rasterTexture], () => {
+		return rasterTexture.createView(d.texture2d());
+	});
 
-    const bindGroup = onceBindGroup(root, cloudCompositeLayout, {
-        cloudTexture: cloudTextureView,
-        pickTexture: pickTextureView,
-        rasterTexture: rasterTextureView,
-        sampler: inputSampler,
-        options: optionsBuffer
-    });
+	const bindGroup = onceBindGroup(root, cloudCompositeLayout, {
+		cloudTexture: cloudTextureView,
+		pickTexture: pickTextureView,
+		rasterTexture: rasterTextureView,
+		sampler: inputSampler,
+		options: optionsBuffer
+	});
 
-    optionsBuffer.write(options);
+	optionsBuffer.write(options);
 
-    pipeline.with(bindGroup).withColorAttachment({
-        view: outputView
-    }).draw(6);
-}
+	pipeline
+		.with(bindGroup)
+		.withColorAttachment({
+			view: outputView
+		})
+		.draw(6);
+};

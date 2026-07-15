@@ -1,11 +1,15 @@
+<script lang="ts">
+	import { resolve } from '$app/paths';
+</script>
+
 <svelte:head><title>Image Color</title></svelte:head>
 
 <div class="wrapper">
 	<h1>Image Color</h1>
 	<nav>
-		<a class="btn" href="/color">Color Cloud</a>
-		<a class="btn" href="/wave">Wave</a>
-		<a class="btn" href="/life">Game of Life</a>
+		<a class="btn" href={resolve('/color')}>Color Cloud</a>
+		<a class="btn" href={resolve('/wave')}>Wave</a>
+		<a class="btn" href={resolve('/life')}>Game of Life</a>
 	</nav>
 </div>
 

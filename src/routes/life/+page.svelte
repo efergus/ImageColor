@@ -7,13 +7,14 @@
 		SkipForwardIcon
 	} from 'phosphor-svelte';
 	import { onDestroy, onMount } from 'svelte';
-	import tgpu, { type TgpuRoot, type TgpuTexture } from 'typegpu';
+	import tgpu, { type TgpuRoot } from 'typegpu';
 	import {
 		gpuDrawSegment,
 		gpuLifeStep,
 		gpuToggleCell,
 		lifeStateFormat,
-		renderLife
+		renderLife,
+		type LifeStateTexture
 	} from './shaders';
 
 	let fps = $state(1);
@@ -79,7 +80,7 @@
 	let height = 0;
 
 	let root: TgpuRoot | null = null;
-	let textures: TgpuTexture[] | null = null;
+	let textures: LifeStateTexture[] | null = null;
 	let needsRender = false;
 
 	// Each cell is seeded alive with a probability that falls off as a Gaussian
@@ -388,13 +389,13 @@
 		}}
 	>
 		<span class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20">
-			{#each thresholdSections as section}
+			{#each thresholdSections as section, i (i)}
 				<span
 					class="absolute h-full {section.color}"
 					style="left: {section.from * 100}%; width: {(section.to - section.from) * 100}%"
 				></span>
 			{/each}
-			{#each thresholdTicks as tick}
+			{#each thresholdTicks as tick, i (i)}
 				<span
 					class="absolute w-px -translate-x-1/2 {tick.major
 						? 'top-0 h-full bg-white/70'
