@@ -478,13 +478,31 @@ export const imageFragment = ({ uv }: { uv: d.v2f }) => {
 	const targetColorOklab = srgb_to_oklab(textureRenderLayout.$.options.selectedColor.rgb);
 	const originalOklab = srgb_to_oklab(original.rgb);
 
+	const distance = std.distance(targetColorOklab, originalOklab);
 	const greyness = std.clamp(
-		(std.distance(targetColorOklab, originalOklab) - targetDistance) * 100.0,
+		(distance - targetDistance) * 100.0,
 		0.0,
-		0.8
+		1.0
 	);
-	const outColor = std.mix(original.rgb, d.vec3f(0.4), d.f32(greyness));
-	return d.vec4f(outColor, original.a);
+
+	const dx = std.dpdx(uv.x);
+	const dy = std.dpdy(uv.y);
+	let closeNeighbors = d.f32(0.0);
+	for (let i = -1; i <= 1; i++) {
+		for (let j = -1; j <= 1; j++) {
+			const neighbor = textureSample(textureRenderLayout.$.texture, textureRenderLayout.$.sampler, std.add(uv, std.mul(d.vec2f(i, j), d.vec2f(dx, dy))));
+			const neighborOklab = srgb_to_oklab(neighbor.rgb);
+			const distance = std.distance(targetColorOklab, neighborOklab);
+			if (distance < targetDistance) {
+				closeNeighbors = std.max(closeNeighbors, d.f32(0.4) + d.f32(i === 0 || j === 0));
+			}
+		}
+	}
+	const whiteness = d.f32(greyness > 0.0) * std.clamp(closeNeighbors, 0.0, 1.0);
+
+	const outColor = std.mix(original.rgb, d.vec3f(0.4), d.f32(greyness * 0.6));
+	const outColorBorder = std.mix(outColor, d.vec3f(1.0), whiteness);
+	return d.vec4f(outColorBorder, original.a);
 };
 
 export const triangleFragmentOutput = d.struct({

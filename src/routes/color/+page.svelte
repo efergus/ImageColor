@@ -582,7 +582,7 @@
 					}
 				}}
 			>
-				<canvas bind:this={colorCanvas} width="800" height="600"></canvas>
+				<canvas bind:this={colorCanvas} width="400" height="300"></canvas>
 				{#if isHovering}
 					<div class="color-display absolute" style="background-color: {color};"></div>
 				{/if}
@@ -624,7 +624,7 @@
 					}
 				}}
 			>
-				<canvas bind:this={imageCanvas} width="800" height="600"></canvas>
+				<canvas bind:this={imageCanvas} width="400" height="300"></canvas>
 				{#if isHovering}
 					<div class="color-display absolute" style="background-color: {color};"></div>
 				{/if}

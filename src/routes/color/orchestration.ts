@@ -402,7 +402,7 @@ export const renderRasterScene = (
 
     // Contrast the grid lines against the background rather than always
     // drawing them white.
-    const lineColor = bgColor > 0.6 ? 0.55 : 0.65;
+    const lineColor = bgColor > 0.6 ? bgColor - 0.3 : bgColor + 0.3;
 
     const encoder = root.device.createCommandEncoder();
 
