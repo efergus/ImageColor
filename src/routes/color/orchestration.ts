@@ -48,10 +48,15 @@ import {
     gridBindLayout,
     gridVertex,
     gridFragment,
-    gridFaceOptions
+    gridFaceOptions,
+    sphereVertexLayout,
+    sphereBindLayout,
+    sphereVertex,
+    sphereFragment,
+    sphereOptions
 } from './shaders';
 import { ColorSpace } from './color_utils';
-import { gridFaces } from './geometry';
+import { gridFaces, sphereVertices } from './geometry';
 
 // A render pass output: either a texture to draw into or a canvas context.
 type RenderTarget = (TgpuTexture & RenderFlag) | GPUCanvasContext;
@@ -432,6 +437,84 @@ export const renderRasterScene = (
     root.device.queue.submit([encoder.finish()]);
 };
 
+// Rasterizes an opaque marker sphere for each saved color, positioned at the
+// color's location in the current color space. Draws into the same
+// color/depth targets as renderRasterScene (which must run first, since it
+// clears them), so the cloud raymarch stops at the spheres.
+export const renderColorSpheres = (
+    root: TgpuRoot,
+    outputTexture: TgpuTexture & RenderFlag,
+    depthTexture: TgpuTexture & RenderFlag & SampledFlag,
+    camera: d.Infer<typeof cameraUniform>,
+    colorSpace: ColorSpace,
+    colors: d.v3f[],
+    lighting: boolean
+) => {
+    if (colors.length === 0) {
+        return;
+    }
+
+    const pipeline = once([renderColorSpheres, colorSpace], () =>
+        root.with(colorSpaceSlot, colorSpacesConfig[colorSpace].forward).createRenderPipeline({
+            vertex: sphereVertex,
+            fragment: sphereFragment,
+            attribs: sphereVertexLayout.attrib,
+            targets: { format: 'rgba8unorm' },
+            depthStencil: {
+                format: 'depth24plus',
+                depthWriteEnabled: true,
+                depthCompare: 'less'
+            }
+        })
+    );
+
+    const { cameraBuffer, vertexBuffer, vertexCount } = once(renderColorSpheres, () => {
+        const vertices = sphereVertices().map((position) => ({ position }));
+        const vertexBuffer = root
+            .createBuffer(sphereVertexLayout.schemaForCount(vertices.length), vertices)
+            .$usage('vertex');
+        const cameraBuffer = root.createBuffer(cameraUniform).$usage('uniform');
+        return { cameraBuffer, vertexBuffer, vertexCount: vertices.length };
+    });
+
+    cameraBuffer.write(camera);
+
+    const encoder = root.device.createCommandEncoder();
+
+    colors.forEach((color, i) => {
+        // Buffers and bind groups are pooled by sphere index and rewritten
+        // every pass, so the color list can grow and shrink freely.
+        const { optionsBuffer, bindGroup } = once([renderColorSpheres, 'sphere', i], () => {
+            const optionsBuffer = root.createBuffer(sphereOptions).$usage('uniform');
+            const bindGroup = root.createBindGroup(sphereBindLayout, {
+                cameraUniform: cameraBuffer,
+                sphereOptions: optionsBuffer
+            });
+            return { optionsBuffer, bindGroup };
+        });
+        optionsBuffer.write({
+            color: d.vec4f(color.x, color.y, color.z, 1.0),
+            radius: 0.02,
+            lighting: lighting ? 1.0 : 0.0
+        });
+
+        pipeline
+            .with(encoder)
+            .withColorAttachment({ view: outputTexture, loadOp: 'load' })
+            .withDepthStencilAttachment({
+                view: depthTexture,
+                depthClearValue: 1.0,
+                depthLoadOp: 'load',
+                depthStoreOp: 'store'
+            })
+            .with(sphereVertexLayout, vertexBuffer)
+            .with(bindGroup)
+            .draw(vertexCount);
+    });
+
+    root.device.queue.submit([encoder.finish()]);
+};
+
 export const renderColorCloud = (
     root: TgpuRoot,
     inputTexture: Texture3d & SampledFlag,
@@ -442,23 +525,27 @@ export const renderColorCloud = (
     colorSpace: ColorSpace,
     camera: d.Infer<typeof cameraUniform>
 ) => {
-    const { pipeline, cameraBuffer } = once([renderColorCloud, colorSpace], () => {
-        const pipeline = root
-            .with(colorSpaceSlot, colorSpacesConfig[colorSpace].forward)
-            .with(colorSpaceInverseSlot, colorSpacesConfig[colorSpace].inverse)
-            .createRenderPipeline({
-                primitive: { topology: 'triangle-list' },
-                vertex: quadVertex,
-                fragment: triangleFragment,
-                targets: {
-                    color: { format: 'rgba8unorm' },
-                    pick: { format: 'rgba8unorm' }
-                }
-            })
-            .withTimestampWrites(timestampOptions(root, 'renderColorCloud'));
-        const cameraBuffer = root.createBuffer(cameraUniform).$usage('uniform');
-        return { pipeline, cameraBuffer };
-    });
+    const { pipeline, cameraBuffer, rasterDepthSizeBuffer } = once(
+        [renderColorCloud, colorSpace],
+        () => {
+            const pipeline = root
+                .with(colorSpaceSlot, colorSpacesConfig[colorSpace].forward)
+                .with(colorSpaceInverseSlot, colorSpacesConfig[colorSpace].inverse)
+                .createRenderPipeline({
+                    primitive: { topology: 'triangle-list' },
+                    vertex: quadVertex,
+                    fragment: triangleFragment,
+                    targets: {
+                        color: { format: 'rgba8unorm' },
+                        pick: { format: 'rgba8unorm' }
+                    }
+                })
+                .withTimestampWrites(timestampOptions(root, 'renderColorCloud'));
+            const cameraBuffer = root.createBuffer(cameraUniform).$usage('uniform');
+            const rasterDepthSizeBuffer = root.createBuffer(d.vec2u).$usage('uniform');
+            return { pipeline, cameraBuffer, rasterDepthSizeBuffer };
+        }
+    );
 
     const inputTextureView = once([renderColorCloud, inputTexture], () => {
         return inputTexture.createView(d.texture3d());
@@ -472,10 +559,13 @@ export const renderColorCloud = (
         cameraUniform: cameraBuffer,
         weightTexture: inputTextureView,
         weightSampler: inputSampler,
-        rasterDepth: rasterDepthView
+        rasterDepth: rasterDepthView,
+        rasterDepthSize: rasterDepthSizeBuffer
     });
 
     cameraBuffer.write(camera);
+    const rawDepth = root.unwrap(rasterDepthTexture);
+    rasterDepthSizeBuffer.write(d.vec2u(rawDepth.width, rawDepth.height));
 
     pipeline
         .with(cameraBindGroup)

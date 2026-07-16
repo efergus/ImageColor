@@ -38,6 +38,7 @@
 		processWeightTexture,
 		renderImage,
 		renderRasterScene,
+		renderColorSpheres,
 		renderColorCloud,
 		compositeColorCloud,
 		readTimings,
@@ -78,6 +79,8 @@
 	let textureSize = $state(d.vec2u(128, 128));
 	let startTime = $state(0);
 	let savedRGB: d.v3f | null = $state(null);
+	let savedColors: d.v3f[] = $state([]);
+	let sphereLighting = $state(false);
 
 	let gpuState: {
 		root: TgpuRoot;
@@ -390,6 +393,15 @@
 				sensitivity
 			};
 			renderRasterScene(root, rasterTexture, rasterDepthTexture, camera, bgColor);
+			renderColorSpheres(
+				root,
+				rasterTexture,
+				rasterDepthTexture,
+				camera,
+				colorSpace,
+				savedColors,
+				sphereLighting
+			);
 			renderColorCloud(
 				root,
 				blurredWeightTexture,
@@ -501,6 +513,20 @@
 		updated = now;
 	};
 
+	const saveHoveredColor = () => {
+		if (!isHovering) return;
+		savedRGB = hoveredRGB;
+		savedColors.push(hoveredRGB);
+		onCloudUpdate();
+		invalidateCaches();
+	};
+
+	const removeSavedColor = (index: number) => {
+		savedColors.splice(index, 1);
+		onCloudUpdate();
+		invalidateCaches();
+	};
+
 	const onFilterUpdate = () => {
 		const now = Date.now();
 		filterUpdated = now;
@@ -577,12 +603,7 @@
 					onCloudUpdate();
 					invalidateCaches();
 				}}
-				onclick={() => {
-					if (isHovering) {
-						savedRGB = hoveredRGB;
-						onUpdate();
-					}
-				}}
+				onclick={saveHoveredColor}
 			>
 				<canvas bind:this={colorCanvas} width="400" height="300"></canvas>
 				{#if isHovering}
@@ -619,12 +640,7 @@
 					isHovering = false;
 					onUpdate();
 				}}
-				onclick={() => {
-					if (isHovering) {
-						savedRGB = hoveredRGB;
-						onUpdate();
-					}
-				}}
+				onclick={saveHoveredColor}
 			>
 				<canvas bind:this={imageCanvas} width="400" height="300"></canvas>
 				{#if isHovering}
@@ -634,7 +650,7 @@
 		</div>
 
 		<div class="flex justify-between">
-			<div>
+			<div class="flex flex-wrap items-center gap-2">
 				<div
 					class="color-display relative"
 					style="background-color: {rgbToHexColor(
@@ -643,6 +659,15 @@
 				>
 					{rgbToHexColor(isHovering ? hoveredRGB : (savedRGB ?? d.vec3f(0, 0, 0)))}
 				</div>
+				{#each savedColors as savedColor, i (i)}
+					<button
+						class="saved-swatch"
+						style="background-color: {rgbToHexColor(savedColor)}"
+						title="{rgbToHexColor(savedColor)} (click to remove)"
+						aria-label="Remove saved color {rgbToHexColor(savedColor)}"
+						onclick={() => removeSavedColor(i)}
+					></button>
+				{/each}
 			</div>
 			<div class="controls">
 				<label class="file-label">
@@ -867,6 +892,18 @@
 						</Select.Portal>
 					</Select.Root>
 				</div>
+
+				<label class="flex cursor-pointer items-center gap-2 text-slate-200 select-none">
+					<input
+						type="checkbox"
+						class="size-4 cursor-pointer accent-blue-600"
+						bind:checked={sphereLighting}
+						onchange={() => {
+							onCloudUpdate();
+						}}
+					/>
+					Sphere lighting
+				</label>
 			</div>
 
 			<!-- Right Column: Image Filters -->
@@ -1020,6 +1057,16 @@
 		align-items: center;
 		justify-content: center;
 		padding: 8px 12px 8px 12px;
+	}
+
+	.saved-swatch {
+		width: 28px;
+		height: 28px;
+		border-radius: 8px;
+		border: 2px solid rgba(255, 255, 255, 0.8);
+		box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+		cursor: pointer;
+		padding: 0;
 	}
 
 	canvas {

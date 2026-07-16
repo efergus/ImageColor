@@ -347,7 +347,11 @@ export const cameraBindLayout = tgpu.bindGroupLayout({
 	cameraUniform: { uniform: cameraUniform },
 	weightTexture: { texture: d.texture3d() },
 	weightSampler: { sampler: 'filtering' },
-	rasterDepth: { texture: d.textureDepth2d() }
+	rasterDepth: { texture: d.textureDepth2d() },
+	// rasterDepth's size in texels. The cloud pass can render at a different
+	// resolution (fast mode halves it), so uv-based depth lookups need the
+	// depth texture's own size rather than the framebuffer's.
+	rasterDepthSize: { uniform: d.vec2u }
 });
 
 // Near/far planes for the rasterized scene's depth buffer. Shared by the
@@ -447,6 +451,81 @@ export const gridFragment = tgpu.fragmentFn({
 	return d.vec4f(color, color, color, alpha);
 });
 
+// Pipeline for rasterizing small opaque marker spheres at saved colors'
+// positions in the cube. They draw into the same color/depth targets as the
+// grid faces, so the cloud raymarch stops at (is occluded by) them.
+export const sphereVertexData = d.struct({
+	position: d.vec3f
+});
+
+export const sphereVertexLayout = tgpu.vertexLayout(d.arrayOf(sphereVertexData));
+
+export const sphereOptions = d.struct({
+	// The marked color in sRGB; its position in the cube comes from the
+	// current color space's forward transform.
+	color: d.vec4f,
+	radius: d.f32,
+	// 1 = shaded so the marker reads as a sphere, 0 = flat exact color.
+	lighting: d.f32
+});
+
+export const sphereBindLayout = tgpu.bindGroupLayout({
+	cameraUniform: { uniform: cameraUniform },
+	sphereOptions: { uniform: sphereOptions }
+});
+
+export const sphereVertex = tgpu.vertexFn({
+	in: { position: d.vec3f },
+	out: { pos: d.builtin.position, normal: d.vec3f, world: d.vec3f }
+})(({ position }) => {
+	'use gpu';
+	const camera = sphereBindLayout.$.cameraUniform;
+	const options = sphereBindLayout.$.sphereOptions;
+	const center = colorSpaceSlot.$(options.color.rgb);
+	const world = std.add(center, std.mul(position, options.radius));
+	return {
+		pos: worldToClip(world, camera.yaw, camera.pitch, camera.radius, camera.aspect),
+		normal: position,
+		world
+	};
+});
+
+// |dot(normal, viewDir)| below this counts as the sphere's black border;
+// higher = thicker border relative to the sphere's projected radius.
+const sphereBorderThreshold = 0.6;
+
+export const sphereFragment = tgpu.fragmentFn({
+	in: { normal: d.vec3f, world: d.vec3f },
+	out: d.vec4f
+})(({ normal, world }) => {
+	'use gpu';
+	const camera = sphereBindLayout.$.cameraUniform;
+	const n = std.normalize(normal);
+
+	// Black border toward the silhouette, where the normal turns
+	// perpendicular to the view direction. The eye position is derived the
+	// same way worldToClip derives it, and fwidth antialiases the edge.
+	const eye = eyeLocation(
+		cameraRotation(camera.yaw, camera.pitch),
+		camera.radius,
+		d.vec3f(0.5, 0.5, 0.5)
+	);
+	const viewDir = std.normalize(std.sub(world, eye));
+	const ndv = std.abs(std.dot(n, viewDir));
+	const aa = std.clamp(std.fwidth(ndv), 0.01, 0.2);
+	const border =
+		1.0 - std.smoothstep(sphereBorderThreshold - aa, sphereBorderThreshold + aa, ndv);
+
+	// Mild lighting so the marker reads as a sphere while staying close to
+	// the color it marks.
+	const light = std.normalize(d.vec3f(0.5, 1.0, 0.75));
+	const lit = 0.7 + 0.3 * std.max(std.dot(n, light), 0.0);
+	const shade = std.mix(d.f32(1.0), lit, sphereBindLayout.$.sphereOptions.lighting);
+	const color = sphereBindLayout.$.sphereOptions.color;
+	const outColor = std.mix(std.mul(color.rgb, shade), d.vec3f(0.0, 0.0, 0.0), border);
+	return d.vec4f(outColor, 1.0);
+});
+
 export const quadVertex = ({ $vertexIndex: vid }: { $vertexIndex: number }) => {
 	'use gpu';
 	const positions = [
@@ -511,11 +590,9 @@ export const triangleFragmentOutput = d.struct({
 });
 
 export const triangleFragment = ({
-	uv,
-	$position: fragCoord
+	uv
 }: {
 	uv: d.v2f;
-	$position: d.v4f;
 }): d.Infer<typeof triangleFragmentOutput> => {
 	'use gpu';
 
@@ -538,11 +615,13 @@ export const triangleFragment = ({
 
 	// The rasterized scene occludes the cloud: decode this pixel's depth-buffer
 	// value back into a distance along the ray and stop marching there.
-	// fragCoord is in framebuffer pixels, which matches the raster pass's
-	// depth texture texel-for-texel since both render at the same size.
+	// The depth texture stays full-resolution while fast mode renders the
+	// cloud at half size, so look it up by uv rather than by framebuffer
+	// pixel to stay aligned at any resolution ratio.
+	const depthSize = cameraBindLayout.$.rasterDepthSize;
 	const rasterDepth = textureLoad(
 		cameraBindLayout.$.rasterDepth,
-		d.vec2u(d.u32(fragCoord.x), d.u32(fragCoord.y)),
+		d.vec2u(d.u32(uv.x * d.f32(depthSize.x)), d.u32(uv.y * d.f32(depthSize.y))),
 		0
 	);
 	if (rasterDepth < 1.0) {

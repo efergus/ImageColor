@@ -29,6 +29,27 @@ const face = (name: string, normal: d.v3f, corner: d.v3f, right: d.v3f, up: d.v3
 	};
 };
 
+// Triangle-list mesh of a unit sphere centered at the origin, so positions
+// double as normals. The degenerate triangles at the poles are harmless.
+export const sphereVertices = (rings = 12, segments = 16): d.v3f[] => {
+	const p = (r: number, s: number) => {
+		const phi = (r / rings) * Math.PI;
+		const theta = (s / segments) * 2 * Math.PI;
+		return d.vec3f(Math.sin(phi) * Math.cos(theta), Math.cos(phi), Math.sin(phi) * Math.sin(theta));
+	};
+	const vertices: d.v3f[] = [];
+	for (let r = 0; r < rings; r++) {
+		for (let s = 0; s < segments; s++) {
+			const a = p(r, s);
+			const b = p(r + 1, s);
+			const c = p(r + 1, s + 1);
+			const e = p(r, s + 1);
+			vertices.push(a, b, c, a, c, e);
+		}
+	}
+	return vertices;
+};
+
 // The six faces of the cloud's unit box [0,1]^3, each spanning the full
 // extent of the other two axes.
 export const gridFaces: GridFace[] = [
