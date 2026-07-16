@@ -640,12 +640,34 @@ export const cloudCompositeFragment = ({ uv }: { uv: d.v2f }) => {
 	const targetColorOklab = srgb_to_oklab(cloudCompositeLayout.$.options.selectedColor.rgb);
 	const pickOklab = srgb_to_oklab(pick.rgb);
 
-	const fade = std.clamp(
-		(std.distance(targetColorOklab, pickOklab) - targetDistance) * 100.0,
-		0.0,
-		0.7
-	);
+	const distance = std.distance(targetColorOklab, pickOklab);
+	const fade = std.clamp((distance - targetDistance) * 100.0, 0.0, 0.4);
 	const alpha = cloud.a * (1.0 - fade);
+
+	const dx = std.dpdx(uv.x);
+	const dy = std.dpdy(uv.y);
+	let closeNeighbors = d.f32(0.0);
+	for (let i = -1; i <= 1; i++) {
+		for (let j = -1; j <= 1; j++) {
+			const offset = std.add(uv, std.mul(d.vec2f(i, j), d.vec2f(dx, dy)));
+			const neighbor = textureSample(
+				cloudCompositeLayout.$.pickTexture,
+				cloudCompositeLayout.$.sampler,
+				offset
+			);
+			const neighborCloud = textureSample(
+				cloudCompositeLayout.$.cloudTexture,
+				cloudCompositeLayout.$.sampler,
+				offset
+			);
+			const neighborOklab = srgb_to_oklab(neighbor.rgb);
+			const neighborDistance = std.distance(targetColorOklab, neighborOklab);
+			if (neighbor.a > 0.0 && neighborCloud.a > 0.1 && neighborDistance < targetDistance) {
+				closeNeighbors = std.max(closeNeighbors, d.f32(0.4) + d.f32(i === 0 || j === 0));
+			}
+		}
+	}
+	const whiteness = d.f32(targetDistance < 100 && (fade > 0.0 || cloud.a < 0.1)) * std.clamp(closeNeighbors, 0.0, 1.0);
 
 	const bgLightness = cloudCompositeLayout.$.options.bgColor;
 	const bg = d.vec3f(bgLightness, bgLightness, bgLightness);
@@ -653,7 +675,8 @@ export const cloudCompositeFragment = ({ uv }: { uv: d.v2f }) => {
 	// what lies in front of it: composite cloud over raster over background.
 	const base = std.mix(bg, raster.rgb, raster.a);
 	const outColor = std.mix(base, cloud.rgb, d.f32(alpha));
-	return d.vec4f(outColor, 1.0);
+	const outColorBorder = std.mix(outColor, d.vec3f(1.0), whiteness);
+	return d.vec4f(outColorBorder, 1.0);
 };
 
 export const filterSlot = tgpu.slot<(uv: d.v2f, color: d.v4f) => d.v4f>();

@@ -9,7 +9,8 @@
 		CaretDoubleDownIcon,
 		CheckIcon,
 		GaugeIcon,
-		SquareHalfIcon
+		SquareHalfIcon,
+		CrosshairIcon
 	} from 'phosphor-svelte';
 	import tgpu, {
 		type RenderFlag,
@@ -64,6 +65,7 @@
 	let sensitivitySlider = $state(3.0);
 	let sensitivity = $derived(sensitivitySlider === 6 ? 0 : Math.pow(10, 3 - sensitivitySlider));
 	let bgColor = $state(0.2);
+	let colorThreshold = $state(0.05);
 	let saturation = $state(1.0);
 	let contrast = $state(1.0);
 	let tableSize = $state(128);
@@ -357,7 +359,7 @@
 		}
 
 		const selectedColor = isHovering
-			? d.vec4f(hoveredRGB.x, hoveredRGB.y, hoveredRGB.z, 0.05)
+			? d.vec4f(hoveredRGB.x, hoveredRGB.y, hoveredRGB.z, colorThreshold)
 			: d.vec4f(0.0, 0.0, 0.0, 1000.0);
 		const colorOklab = srgb_to_oklab(selectedColor.xyz);
 		contrastRGB = colorOklab.x > 0.45 ? d.vec3f(0, 0, 0) : d.vec3f(1, 1, 1);
@@ -713,6 +715,35 @@
 								bgColor = v;
 								onCloudUpdate();
 								invalidateCaches();
+							}}
+						>
+							<span
+								class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20"
+							>
+								<Slider.Range class="absolute h-full bg-blue-600" />
+							</span>
+							<Slider.Thumb
+								index={0}
+								class="block size-[20px] cursor-pointer rounded-full border-2 border-blue-600 bg-white shadow-sm transition-colors hover:border-white/30 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50 data-active:scale-[0.98] data-active:border-white/30"
+							/>
+						</Slider.Root>
+					</div>
+				</div>
+
+				<div class="flex w-full flex-col gap-1">
+					<div class="pl-8 text-sm text-slate-400">
+						<span>Color Threshold</span>
+					</div>
+					<div class="flex items-center gap-2">
+						<CrosshairIcon size={24} class="text-slate-400" />
+						<Slider.Root
+							type="single"
+							value={colorThreshold}
+							max={0.3}
+							step={0.005}
+							class="relative flex w-full touch-none items-center select-none"
+							onValueChange={(v) => {
+								colorThreshold = v;
 							}}
 						>
 							<span
