@@ -424,16 +424,40 @@ export const gridVertex = tgpu.vertexFn({
 // How many cells the grid is divided into across each face.
 const gridDivisions = 10;
 
-// Screen-space-anti-aliased distance to the nearest grid line, in [0, 1]
-// (1 = right on a line, 0 = a cell's-width or further from one).
+// Grid line width, as a fraction of one grid cell.
+const gridLineWidth = 0.05;
+
+// Anti-aliased grid line coverage in [0, 1], following Ben Golus's
+// "pristine grid" construction. The drawn line width is clamped to at least
+// a pixel (with the line dimmed proportionally to conserve energy) and to at
+// most half a cell; where a pixel spans most of a cell or more, coverage
+// converges to the grid's constant average instead. This keeps grazing
+// angles a faint stable tint rather than moiré or solid line color.
 const gridLineAlpha = (uv: d.v2f) => {
 	'use gpu';
 	const coord = std.mul(uv, d.f32(gridDivisions));
-	const centered = std.sub(std.fract(std.sub(coord, d.vec2f(0.5, 0.5))), d.vec2f(0.5, 0.5));
-	const dist = std.abs(centered);
-	const width = std.fwidth(coord);
-	const line = std.min(dist.x / width.x, dist.y / width.y);
-	return 1.0 - std.clamp(line, 0.0, 1.0);
+	const deriv = std.fwidth(coord);
+	const target = d.vec2f(gridLineWidth, gridLineWidth);
+	const drawWidth = std.clamp(target, deriv, d.vec2f(0.5, 0.5));
+	const lineAA = std.mul(deriv, d.f32(1.5));
+
+	// Distance to the nearest line, doubled so it spans [0, 1] per cell.
+	const gridUV = std.sub(
+		d.vec2f(1.0, 1.0),
+		std.abs(std.sub(std.mul(std.fract(coord), d.f32(2.0)), d.vec2f(1.0, 1.0)))
+	);
+
+	let grid2 = std.sub(
+		d.vec2f(1.0, 1.0),
+		std.smoothstep(std.sub(drawWidth, lineAA), std.add(drawWidth, lineAA), gridUV)
+	);
+	// Dim lines that were clamped up to pixel width, and converge to the
+	// average coverage once a pixel spans half a cell or more.
+	grid2 = std.mul(grid2, std.saturate(std.div(target, drawWidth)));
+	grid2 = std.mix(grid2, target, std.saturate(std.sub(std.mul(deriv, d.f32(2.0)), d.vec2f(1.0, 1.0))));
+
+	// Union of the two axes' coverage.
+	return std.mix(grid2.x, 1.0, grid2.y);
 };
 
 export const gridFragment = tgpu.fragmentFn({
