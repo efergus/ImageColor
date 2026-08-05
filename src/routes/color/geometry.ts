@@ -13,18 +13,28 @@ export type GridFace = {
 	vertices: GridVertex[];
 };
 
+// Pad each face slightly past the unit square so the border grid lines'
+// outer halves (and their AA falloff) land inside the geometry instead of
+// being clipped by the polygon edge. The grid function is periodic, so uv
+// outside [0,1] evaluates the border lines' outer halves correctly, and the
+// fragment shader discards the rest of the padding. Must stay well under one
+// grid cell (0.1) so the padding never reaches the next periodic line.
+const facePad = 0.02;
+
 const face = (name: string, normal: d.v3f, corner: d.v3f, right: d.v3f, up: d.v3f): GridFace => {
 	const p = (u: number, v: number) => corner.add(right.mul(u)).add(up.mul(v));
+	const lo = -facePad;
+	const hi = 1 + facePad;
 	return {
 		name,
 		normal,
 		vertices: [
-			{ position: p(0, 0), uv: d.vec2f(0, 0) },
-			{ position: p(1, 0), uv: d.vec2f(1, 0) },
-			{ position: p(1, 1), uv: d.vec2f(1, 1) },
-			{ position: p(0, 0), uv: d.vec2f(0, 0) },
-			{ position: p(1, 1), uv: d.vec2f(1, 1) },
-			{ position: p(0, 1), uv: d.vec2f(0, 1) }
+			{ position: p(lo, lo), uv: d.vec2f(lo, lo) },
+			{ position: p(hi, lo), uv: d.vec2f(hi, lo) },
+			{ position: p(hi, hi), uv: d.vec2f(hi, hi) },
+			{ position: p(lo, lo), uv: d.vec2f(lo, lo) },
+			{ position: p(hi, hi), uv: d.vec2f(hi, hi) },
+			{ position: p(lo, hi), uv: d.vec2f(lo, hi) }
 		]
 	};
 };

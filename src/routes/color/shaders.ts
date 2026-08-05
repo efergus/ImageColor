@@ -456,6 +456,16 @@ const gridLineAlpha = (uv: d.v2f) => {
 	grid2 = std.mul(grid2, std.saturate(std.div(target, drawWidth)));
 	grid2 = std.mix(grid2, target, std.saturate(std.sub(std.mul(deriv, d.f32(2.0)), d.vec2f(1.0, 1.0))));
 
+	// End lines at the face boundary so they don't run into the quad's
+	// padding: an antialiased ramp on the signed distance to the nearer end
+	// of the [0, gridDivisions] range, applied along each line's length (a
+	// line at constant x runs along y, so grid2.x is masked by y's ramp).
+	// Lines' transverse halves still spill into the padding — that clipped
+	// spill is what the padding exists to antialias.
+	const endDist = std.min(coord, std.sub(d.vec2f(gridDivisions, gridDivisions), coord));
+	const inside = std.saturate(std.add(std.div(endDist, lineAA), d.vec2f(0.5, 0.5)));
+	grid2 = std.mul(grid2, d.vec2f(inside.y, inside.x));
+
 	// Union of the two axes' coverage.
 	return std.mix(grid2.x, 1.0, grid2.y);
 };
