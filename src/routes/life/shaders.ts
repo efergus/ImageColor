@@ -7,6 +7,7 @@ import tgpu, {
 	type TgpuTexture
 } from 'typegpu';
 import { textureLoad } from 'typegpu/std';
+import { randf } from '@typegpu/noise';
 import { once, onceBindGroup } from '$lib/gpu/gpu_utils';
 import { quadVertex } from '../color/shaders';
 
@@ -25,7 +26,14 @@ const stepConstants = d.struct({
 	grow: d.f32,
 	crowd: d.f32,
 	linear: d.u32,
-	window: d.u32
+	window: d.u32,
+	step: d.u32,
+	seed: d.f32,
+	radiation: d.f32,
+});
+const cameraConstants = d.struct({
+	size: d.vec2f,
+	center: d.vec2f,
 });
 
 export const lifeStateFormat = 'r32float';
@@ -42,9 +50,15 @@ export type LifeStateTexture = TgpuTexture<{
 export const lifeStepLayout = tgpu.bindGroupLayout({
 	size: { uniform: array2dSize },
 	constants: { uniform: stepConstants },
+	previous: { storageTexture: d.textureStorage2d(lifeStateFormat, 'read-only') },
 	current: { storageTexture: d.textureStorage2d(lifeStateFormat, 'read-only') },
 	next: { storageTexture: d.textureStorage2d(lifeStateFormat, 'write-only') }
 });
+
+const cellAtPrev = (x: number, y: number) => {
+	'use gpu';
+	return textureLoad(lifeStepLayout.$.previous, d.vec2u(x, y)).x;
+};
 
 const cellAt = (x: number, y: number) => {
 	'use gpu';
@@ -56,6 +70,9 @@ export const applyLifeStep = (x: number, y: number) => {
 	const width = lifeStepLayout.$.size.width;
 	const height = lifeStepLayout.$.size.height;
 	const window = lifeStepLayout.$.constants.window;
+	const step = lifeStepLayout.$.constants.step;
+	randf.seed3(d.vec3f(x, y, lifeStepLayout.$.constants.seed));
+	randf.seed3(d.vec3f(randf.sample(), x * y % 1000, d.f32(step % 1000 + (step * 486653) % 1000)));
 
 	// Sum every cell in the (2*window+1)^2 square around (x, y) with toroidal
 	// wrap-around, then drop the center cell. The window*(size-1) offset is
@@ -69,6 +86,8 @@ export const applyLifeStep = (x: number, y: number) => {
 			total = total + cellAt(nx, ny);
 		}
 	}
+
+	total = total + cellAtPrev(x, y);
 
 	const alive = cellAt(x, y);
 
@@ -91,6 +110,17 @@ export const applyLifeStep = (x: number, y: number) => {
 		target = alive;
 	}
 
+	// let blip2 = d.f32(1.0);
+	// let radiation2 = 0.5;
+	// while (radiation2 > d.f32(0.0) && radiation2 < (2 ** -8)) {
+	// 	blip2 *= randf.bernoulli(2 ** -8);
+	// 	radiation2 *= 2 ** 8;
+	// }
+	// blip2 *= std.select(randf.bernoulli(radiation2), 0, radiation2 === 0);
+	// if (blip2) {
+	// 	target = alive;
+	// }
+
 	// Exponential eases toward the target by a discreteness fraction of the
 	// remaining distance each step; linear moves a fixed discreteness step,
 	// clamped so it stops exactly at the target.
@@ -99,12 +129,22 @@ export const applyLifeStep = (x: number, y: number) => {
 	if (lifeStepLayout.$.constants.linear !== 0) {
 		updated = alive + std.clamp(target - alive, -discreteness, discreteness);
 	}
+	let blip = d.f32(1.0);
+	let radiation = lifeStepLayout.$.constants.radiation;
+	while (radiation > d.f32(0.0) && radiation < (2 ** -8)) {
+		blip *= randf.bernoulli(2 ** -8);
+		radiation *= 2 ** 8;
+	}
+	blip *= std.select(randf.bernoulli(radiation), 0, radiation === 0);
+
+	updated = std.max(updated, blip);
 
 	std.textureStore(lifeStepLayout.$.next, d.vec2u(x, y), d.vec4f(updated, 0.0, 0.0, 0.0));
 };
 
 export const gpuLifeStep = (
 	root: TgpuRoot,
+	previous: LifeStateTexture,
 	current: LifeStateTexture,
 	next: LifeStateTexture,
 	options: {
@@ -114,8 +154,11 @@ export const gpuLifeStep = (
 		stay: number;
 		grow: number;
 		crowd: number;
+		radiation: number;
 		linear: boolean;
 		window: number;
+		step: number;
+		seed: number;
 	}
 ) => {
 	const { pipeline, sizeUniform, constantsUniform } = once(gpuLifeStep, () => {
@@ -128,6 +171,7 @@ export const gpuLifeStep = (
 	const bindGroup = onceBindGroup(root, lifeStepLayout, {
 		size: sizeUniform,
 		constants: constantsUniform,
+		previous: previous,
 		current: current,
 		next: next
 	});
@@ -142,8 +186,11 @@ export const gpuLifeStep = (
 		stay: options.stay,
 		grow: options.grow,
 		crowd: options.crowd,
+		radiation: options.radiation,
 		linear: options.linear ? 1 : 0,
-		window: options.window
+		window: options.window,
+		step: options.step,
+		seed: options.seed
 	});
 
 	pipeline.with(bindGroup).dispatchThreads(options.width, options.height);
@@ -264,6 +311,7 @@ export const gpuDrawSegment = (
 
 export const lifeRenderLayout = tgpu.bindGroupLayout({
 	size: { uniform: array2dSize },
+	camera: { uniform: cameraConstants },
 	cells: { storageTexture: d.textureStorage2d(lifeStateFormat, 'read-only') }
 });
 
@@ -275,9 +323,13 @@ export const lifeFragment = ({ uv }: { uv: d.v2f }): d.Infer<typeof lifeFragment
 	'use gpu';
 	const width = lifeRenderLayout.$.size.width;
 	const height = lifeRenderLayout.$.size.height;
-	const x = std.min(d.u32(uv.x * d.f32(width)), width - 1);
-	const y = std.min(d.u32(uv.y * d.f32(height)), height - 1);
-	const alive = textureLoad(lifeRenderLayout.$.cells, d.vec2u(x, y)).x;
+	const cameraSize = lifeRenderLayout.$.camera.size;
+	const cameraCenter = lifeRenderLayout.$.camera.center;
+	const texturePosition = std.add(std.sub(std.mul(uv, cameraSize), std.mul(cameraSize, 0.5)), cameraCenter);
+	let alive = 0;
+	if (texturePosition.x >= 0 && texturePosition.x < width && texturePosition.y >= 0 && texturePosition.y < height) {
+		alive = textureLoad(lifeRenderLayout.$.cells, d.vec2u(texturePosition)).x;
+	}
 	const brightness = std.clamp(alive, 0.0, 1.0);
 	return {
 		color: d.vec4f(brightness, brightness, brightness, 1.0)
@@ -291,9 +343,11 @@ export const renderLife = (
 	options: {
 		width: number;
 		height: number;
+		cameraSize: d.v2f;
+		cameraCenter: d.v2f;
 	}
 ) => {
-	const { pipeline, sizeUniform } = once(renderLife, () => {
+	const { pipeline, sizeUniform, cameraUniform } = once(renderLife, () => {
 		const pipeline = root.createRenderPipeline({
 			primitive: { topology: 'triangle-list' },
 			vertex: quadVertex,
@@ -303,11 +357,13 @@ export const renderLife = (
 			}
 		});
 		const sizeUniform = root.createBuffer(array2dSize).$usage('uniform');
-		return { pipeline, sizeUniform };
+		const cameraUniform = root.createBuffer(cameraConstants).$usage('uniform');
+		return { pipeline, sizeUniform, cameraUniform };
 	});
 
 	const bindGroup = onceBindGroup(root, lifeRenderLayout, {
 		size: sizeUniform,
+		camera: cameraUniform,
 		cells: cells
 	});
 
@@ -315,6 +371,11 @@ export const renderLife = (
 		width: options.width,
 		height: options.height
 	});
+
+	cameraUniform.write({
+		size: options.cameraSize,
+		center: options.cameraCenter
+	})
 
 	pipeline
 		.with(bindGroup)
