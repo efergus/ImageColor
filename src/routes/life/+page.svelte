@@ -7,7 +7,7 @@
 		SkipForwardIcon
 	} from 'phosphor-svelte';
 	import { onDestroy, onMount } from 'svelte';
-	import tgpu, { type TgpuRoot } from 'typegpu';
+	import tgpu, { d, type TgpuRoot } from 'typegpu';
 	import {
 		gpuDrawSegment,
 		gpuLifeStep,
@@ -17,11 +17,15 @@
 		type LifeStateTexture
 	} from './shaders';
 
-	let fps = $state(1);
+	let fps = $state(30);
 	let paused = $state(false);
-	let cellSize = $state(8);
+	let widthPower = $state(10);
 	let discreteness = $state(1);
-	let linearChange = $state(false);
+	let radiation = $state(0);
+	let linearChange = $state(true);
+	let step = $state(0);
+	let cameraCenter = $state(d.vec2f(512, 512));
+	let cameraWidth = $state(1024);
 
 	// How far the neighborhood extends around each cell, in cells.
 	let neighborWindow = $state(1);
@@ -35,6 +39,8 @@
 	const positionToTotal = (p: number, max: number) => minTotal * Math.pow(max / minTotal, p);
 	const totalToPosition = (total: number, max: number) =>
 		Math.log(total / minTotal) / Math.log(max / minTotal);
+
+	const radiationPositionToTotal = (p: number) => (p === 0 ? 0 : 10 ** (p * 4 - 6));
 
 	// Thumb positions are the source of truth so the slider's value is
 	// always exactly what it last emitted; deriving them from the thresholds
@@ -78,6 +84,7 @@
 	// both axes are the viewport extent divided by the same cell size.
 	let width = 0;
 	let height = 0;
+	let aspect = 1;
 
 	let root: TgpuRoot | null = null;
 	let textures: LifeStateTexture[] | null = null;
@@ -87,15 +94,15 @@
 	// from the grid center: seedAliveChance at the peak, variance in cells^2.
 	const buildSeedState = () => {
 		const data = new Float32Array(width * height);
-		const cx = (width - 1) / 2;
-		const cy = (height - 1) / 2;
-		for (let y = 0; y < height; y++) {
-			for (let x = 0; x < width; x++) {
-				const distSq = (x - cx) * (x - cx) + (y - cy) * (y - cy);
-				const chance = seedAliveChance * Math.exp(-distSq / (2 * seedVariance));
-				data[x + y * width] = Math.random() < chance ? 1 : 0;
-			}
-		}
+		// const cx = (width - 1) / 2;
+		// const cy = (height - 1) / 2;
+		// for (let y = 0; y < height; y++) {
+		// 	for (let x = 0; x < width; x++) {
+		// 		const distSq = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+		// 		const chance = seedAliveChance * Math.exp(-distSq / (2 * seedVariance));
+		// 		data[x + y * width] = Math.random() < chance ? 1 : 0;
+		// 	}
+		// }
 		return data;
 	};
 
@@ -106,12 +113,13 @@
 		const dpr = window.devicePixelRatio || 1;
 		canvas.width = Math.round(window.innerWidth * dpr);
 		canvas.height = Math.round(window.innerHeight * dpr);
-		width = Math.max(1, Math.round(window.innerWidth / cellSize));
-		height = Math.max(1, Math.round(window.innerHeight / cellSize));
+		aspect = canvas.width / canvas.height;
+		width = 2 ** widthPower;
+		height = width;
 
 		const old = textures;
 		const r = root;
-		textures = [0, 1].map(() =>
+		textures = [0, 1, 2].map(() =>
 			r.createTexture({ size: [width, height], format: lifeStateFormat }).$usage('storage')
 		);
 		textures[0].write(buildSeedState());
@@ -162,8 +170,10 @@
 
 	const cellFromEvent = (e: PointerEvent) => {
 		const rect = canvas.getBoundingClientRect();
-		const x = Math.floor(((e.clientX - rect.left) / rect.width) * width);
-		const y = Math.floor(((e.clientY - rect.top) / rect.height) * height);
+		const x = Math.floor(((e.clientX - rect.left) / rect.width) * cameraWidth - cameraCenter.x);
+		const y = Math.floor(
+			(((e.clientY - rect.top) / rect.height) * cameraWidth) / aspect - cameraCenter.y
+		);
 		return {
 			x: Math.min(Math.max(x, 0), width - 1),
 			y: Math.min(Math.max(y, 0), height - 1)
@@ -198,38 +208,48 @@
 			width,
 			height
 		});
-		textures = [textures[1], textures[0]];
+		textures = [textures[1], textures[2], textures[0]];
 		lastCell = cell;
 		needsRender = true;
 	};
 
+	const onWheel = (e: WheelEvent) => {
+		const zoom = e.deltaY;
+		cameraWidth *= Math.exp(zoom / 300);
+	};
+
 	const stepOnce = () => {
 		if (!root || !textures) return;
-		gpuLifeStep(root, textures[0], textures[1], {
+		gpuLifeStep(root, textures[2], textures[0], textures[1], {
 			width,
 			height,
 			discreteness,
+			radiation: radiationPositionToTotal(radiation),
 			stay: thresholds[0],
 			grow: thresholds[1],
 			crowd: thresholds[2],
 			linear: linearChange,
-			window: neighborWindow
+			window: neighborWindow,
+			step,
+			seed: Math.random()
 		});
-		textures = [textures[1], textures[0]];
+		textures = [textures[1], textures[2], textures[0]];
 		needsRender = true;
+		step += 1;
 	};
 
 	const reset = () => {
 		if (!textures) return;
 		textures[0].write(buildSeedState());
 		needsRender = true;
+		step = 0;
 	};
 
 	const onPointerUp = (e: PointerEvent) => {
 		if (downPos && !dragging && root && textures) {
 			const { x, y } = cellFromEvent(e);
 			gpuToggleCell(root, textures[0], textures[1], { x, y, width, height });
-			textures = [textures[1], textures[0]];
+			textures = [textures[1], textures[2], textures[0]];
 			needsRender = true;
 		}
 		downPos = null;
@@ -257,10 +277,12 @@
 				stepOnce();
 				lastStep = now;
 			}
-			if (needsRender) {
-				renderLife(root, textures[0], context, { width, height });
-				needsRender = false;
-			}
+			renderLife(root, textures[0], context, {
+				width,
+				height,
+				cameraSize: d.vec2f(cameraWidth, cameraWidth / aspect),
+				cameraCenter: cameraCenter
+			});
 			requestAnimationFrame(frame);
 		};
 		requestAnimationFrame(frame);
@@ -280,6 +302,7 @@
 	onpointerdown={onPointerDown}
 	onpointermove={onPointerMove}
 	onpointerup={onPointerUp}
+	onwheel={onWheel}
 ></canvas>
 
 <div
@@ -349,6 +372,27 @@
 		class="relative flex w-full touch-none items-center select-none"
 		onValueChange={(v) => {
 			discreteness = v;
+		}}
+	>
+		<span class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20">
+			<Slider.Range class="absolute h-full bg-blue-600" />
+		</span>
+		<Slider.Thumb
+			index={0}
+			class="block size-[20px] cursor-pointer rounded-full border-2 border-blue-600 bg-white shadow-sm transition-colors hover:border-white/30 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50 data-active:scale-[0.98] data-active:border-white/30"
+		/>
+	</Slider.Root>
+
+	<span>Radiation: {radiationPositionToTotal(radiation).toPrecision(2)}</span>
+	<Slider.Root
+		type="single"
+		value={radiation}
+		min={0}
+		max={1}
+		step={0.01}
+		class="relative flex w-full touch-none items-center select-none"
+		onValueChange={(v) => {
+			radiation = v;
 		}}
 	>
 		<span class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20">
@@ -440,16 +484,16 @@
 		/>
 	</Slider.Root>
 
-	<span>Cell size: {cellSize} px</span>
+	<span>Width: {2 ** widthPower} px</span>
 	<Slider.Root
 		type="single"
-		value={cellSize}
-		min={2}
-		max={50}
+		value={widthPower}
+		min={8}
+		max={14}
 		step={1}
 		class="relative flex w-full touch-none items-center select-none"
 		onValueChange={(v) => {
-			cellSize = v;
+			widthPower = v;
 			rebuild();
 		}}
 	>
