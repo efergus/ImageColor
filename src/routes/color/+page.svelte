@@ -9,7 +9,8 @@
 		CaretDoubleDownIcon,
 		CheckIcon,
 		GaugeIcon,
-		SquareHalfIcon
+		SquareHalfIcon,
+		CrosshairIcon
 	} from 'phosphor-svelte';
 	import tgpu, {
 		type RenderFlag,
@@ -17,12 +18,8 @@
 		type StorageFlag,
 		type TgpuBuffer,
 		type TgpuFixedSampler,
-		type TgpuGuardedComputePipeline,
-		type TgpuQuerySet,
-		type TgpuRenderPipeline,
 		type TgpuRoot,
-		type TgpuTexture,
-		type UniformFlag
+		type TgpuTexture
 	} from 'typegpu';
 	import * as d from 'typegpu/data';
 	import beeCloseImg from '$lib/assets/bee_close.jpg';
@@ -35,25 +32,20 @@
 		{ name: 'Pastels', src: pastelsImg }
 	];
 
-	const tableSizes = [
-		{ value: '16', label: '16' },
-		{ value: '32', label: '32' },
-		{ value: '64', label: '64' },
-		{ value: '128', label: '128' }
-	];
-
 	import {
 		calculateWeights,
 		filterTexture,
 		processWeightTexture,
-		blurWeightTexture,
 		renderImage,
+		renderRasterScene,
+		renderColorSpheres,
 		renderColorCloud,
+		compositeColorCloud,
 		readTimings,
 		colorSpacesConfig
 	} from './orchestration';
 	import { once } from '$lib/gpu/gpu_utils';
-	import { ColorSpace, oklab_to_srgb, srgb_to_oklab } from './color_utils';
+	import { ColorSpace, srgb_to_oklab } from './color_utils';
 
 	const colorSpaces = Object.entries(colorSpacesConfig).map(([value, config]) => ({
 		value: value as ColorSpace,
@@ -65,17 +57,19 @@
 	let updated = $state(0.0);
 	let filterUpdated = $state(0.0);
 	let filterCalculated = $state(0.0);
+	let cloudUpdated = $state(0.0);
+	let cloudRendered = $state(0.0);
+	let cloudRenderedFast = $state(false);
 	let yaw = $state(0.4);
 	let pitch = $state(0.2);
 	let radius = $state(1);
-	let steps = $state(24);
 	let sensitivitySlider = $state(3.0);
 	let sensitivity = $derived(sensitivitySlider === 6 ? 0 : Math.pow(10, 3 - sensitivitySlider));
 	let bgColor = $state(0.2);
+	let colorThreshold = $state(0.05);
 	let saturation = $state(1.0);
 	let contrast = $state(1.0);
 	let tableSize = $state(128);
-	let tableSizeStr = $state('128');
 	let colorSpace = $state(ColorSpace.oklab);
 	let color = $state('rgba(0, 0, 0, 1)');
 	let isHovering = $state(false);
@@ -85,17 +79,19 @@
 	let textureSize = $state(d.vec2u(128, 128));
 	let startTime = $state(0);
 	let savedRGB: d.v3f | null = $state(null);
+	let savedColors: d.v3f[] = $state([]);
+	let sphereLighting = $state(false);
 
 	let gpuState: {
 		root: TgpuRoot;
 		context: GPUCanvasContext;
 		imageContext: GPUCanvasContext;
 		imageBitmap: ImageBitmap;
-		imageTexture: TgpuTexture & StorageFlag & SampledFlag;
-		filteredTexture: TgpuTexture & RenderFlag & SampledFlag;
+		imageTexture: TgpuTexture & RenderFlag & StorageFlag & SampledFlag;
+		filteredTexture: TgpuTexture & RenderFlag & StorageFlag & SampledFlag;
 		pickStagingBuffer: TgpuBuffer<d.WgslArray<d.U32>>;
 		linearSampler: TgpuFixedSampler;
-		blurredWeightTexture: any;
+		blurredWeightTexture: ReturnType<typeof processWeightTexture> | null;
 	} | null = null;
 
 	let isReadingBack = false;
@@ -245,7 +241,7 @@
 			invalidateCaches();
 			const encoder = gpuState.root.device.createCommandEncoder();
 			computeWeightTexture(tableSize);
-			updated = Date.now();
+			onCloudUpdate();
 			gpuState.root.device.queue.submit([encoder.finish()]);
 		} catch (e) {
 			console.error('Failed to load new image', e);
@@ -282,6 +278,16 @@
 				.createTexture({
 					size: [width, height],
 					format: 'rgba8unorm'
+				})
+				.$usage('render', 'sampled')
+		);
+
+	const getDepthTexture = (root: TgpuRoot, uniqueName: string, width: number, height: number) =>
+		once([getDepthTexture, uniqueName, width, height], () =>
+			root
+				.createTexture({
+					size: [width, height],
+					format: 'depth24plus'
 				})
 				.$usage('render', 'sampled')
 		);
@@ -350,45 +356,65 @@
 		const { root, linearSampler, context, imageContext, filteredTexture, blurredWeightTexture } =
 			gpuState;
 
+		if (!blurredWeightTexture) {
+			requestAnimationFrame(() => renderScene());
+			return;
+		}
+
 		const selectedColor = isHovering
-			? d.vec4f(hoveredRGB.x, hoveredRGB.y, hoveredRGB.z, 0.05)
+			? d.vec4f(hoveredRGB.x, hoveredRGB.y, hoveredRGB.z, colorThreshold)
 			: d.vec4f(0.0, 0.0, 0.0, 1000.0);
 		const colorOklab = srgb_to_oklab(selectedColor.xyz);
 		contrastRGB = colorOklab.x > 0.45 ? d.vec3f(0, 0, 0) : d.vec3f(1, 1, 1);
 
-		const fast = now - updated < 100 && now > startTime + 1000;
+		const fast = now - cloudUpdated < 100 && now > startTime + 1000;
 		const renderSize = fast
 			? [colorCanvas.width >> 1, colorCanvas.height >> 1]
 			: [colorCanvas.width, colorCanvas.height];
-		const steps = fast ? 20 : 64;
-		const pickTexture = getTexture(gpuState.root, 'pickTexture', renderSize[0], renderSize[1]);
-
-		const pickView = (pickTexture as any).createView('render');
+		const pickTexture = getTexture(root, 'pickTexture', renderSize[0], renderSize[1]);
 		const cloudTexture = getTexture(root, 'cloudTexture', renderSize[0], renderSize[1]);
-		const cloudView = (cloudTexture as any).createView('render');
-		renderColorCloud(
+		const rasterTexture = getTexture(root, 'rasterTexture', colorCanvas.width, colorCanvas.height);
+		const rasterDepthTexture = getDepthTexture(
 			root,
-			blurredWeightTexture,
-			linearSampler,
-			cloudView,
-			pickView,
-			colorSpace,
-			{
-				textureSize,
-				saturation,
-				contrast,
-				selectedColor
-			},
-			{
+			'rasterDepthTexture',
+			colorCanvas.width,
+			colorCanvas.height
+		);
+
+		const cloudDirty = cloudUpdated > cloudRendered || fast !== cloudRenderedFast;
+		if (cloudDirty) {
+			const steps = fast ? 20 : 64;
+			const camera = {
 				yaw,
 				pitch,
 				radius,
 				aspect: colorCanvas.width / colorCanvas.height,
 				steps,
-				sensitivity,
-				bgColor
-			}
-		);
+				sensitivity
+			};
+			renderRasterScene(root, rasterTexture, rasterDepthTexture, camera, bgColor);
+			renderColorSpheres(
+				root,
+				rasterTexture,
+				rasterDepthTexture,
+				camera,
+				colorSpace,
+				savedColors,
+				sphereLighting
+			);
+			renderColorCloud(
+				root,
+				blurredWeightTexture,
+				linearSampler,
+				rasterDepthTexture,
+				cloudTexture,
+				pickTexture,
+				colorSpace,
+				camera
+			);
+			cloudRendered = now;
+			cloudRenderedFast = fast;
+		}
 
 		renderImage(root, filteredTexture, linearSampler, imageContext, {
 			textureSize,
@@ -397,15 +423,13 @@
 			selectedColor
 		});
 
-		renderImage(root, cloudTexture, linearSampler, context, {
-			textureSize,
-			saturation,
-			contrast,
-			selectedColor: d.vec4f(0.0, 0.0, 0.0, 1000.0)
+		compositeColorCloud(root, cloudTexture, pickTexture, rasterTexture, linearSampler, context, {
+			selectedColor,
+			bgColor
 		});
 
 		await root.device.queue.onSubmittedWorkDone();
-		if (!fast) {
+		if (!fast && cloudDirty) {
 			invalidateCaches();
 		}
 		readTimings();
@@ -463,7 +487,7 @@
 			};
 
 			computeWeightTexture(tableSize);
-			updated = Date.now();
+			onCloudUpdate();
 			startTime = Date.now();
 			renderScene();
 		} catch (e) {
@@ -483,20 +507,31 @@
 		updated = Date.now();
 	};
 
-	const onFilterUpdate = () => {
+	const onCloudUpdate = () => {
 		const now = Date.now();
-		filterUpdated = now;
+		cloudUpdated = now;
 		updated = now;
 	};
 
-	const onTableSizeChange = (v: string) => {
-		tableSizeStr = v;
-		tableSize = parseInt(v);
-		if (gpuState) {
-			invalidateCaches();
-			computeWeightTexture(tableSize);
-			updated = Date.now();
-		}
+	const saveHoveredColor = () => {
+		if (!isHovering) return;
+		savedRGB = hoveredRGB;
+		savedColors.push(hoveredRGB);
+		onCloudUpdate();
+		invalidateCaches();
+	};
+
+	const removeSavedColor = (index: number) => {
+		savedColors.splice(index, 1);
+		onCloudUpdate();
+		invalidateCaches();
+	};
+
+	const onFilterUpdate = () => {
+		const now = Date.now();
+		filterUpdated = now;
+		cloudUpdated = now;
+		updated = now;
 	};
 </script>
 
@@ -550,7 +585,7 @@
 
 					yaw -= deltaX / 100;
 					pitch += deltaY / 100;
-					updated = Date.now();
+					onCloudUpdate();
 					invalidateCaches();
 				}}
 				onmouseenter={() => {
@@ -565,17 +600,12 @@
 					event.preventDefault();
 					radius += event.deltaY * 0.005;
 					radius = Math.max(0.5, Math.min(3.0, radius));
-					onUpdate();
+					onCloudUpdate();
 					invalidateCaches();
 				}}
-				onclick={() => {
-					if (isHovering) {
-						savedRGB = hoveredRGB;
-						onUpdate();
-					}
-				}}
+				onclick={saveHoveredColor}
 			>
-				<canvas bind:this={colorCanvas} width="800" height="600"></canvas>
+				<canvas bind:this={colorCanvas} width="400" height="300"></canvas>
 				{#if isHovering}
 					<div class="color-display absolute" style="background-color: {color};"></div>
 				{/if}
@@ -610,14 +640,9 @@
 					isHovering = false;
 					onUpdate();
 				}}
-				onclick={() => {
-					if (isHovering) {
-						savedRGB = hoveredRGB;
-						onUpdate();
-					}
-				}}
+				onclick={saveHoveredColor}
 			>
-				<canvas bind:this={imageCanvas} width="800" height="600"></canvas>
+				<canvas bind:this={imageCanvas} width="400" height="300"></canvas>
 				{#if isHovering}
 					<div class="color-display absolute" style="background-color: {color};"></div>
 				{/if}
@@ -625,7 +650,7 @@
 		</div>
 
 		<div class="flex justify-between">
-			<div>
+			<div class="flex flex-wrap items-center gap-2">
 				<div
 					class="color-display relative"
 					style="background-color: {rgbToHexColor(
@@ -634,6 +659,15 @@
 				>
 					{rgbToHexColor(isHovering ? hoveredRGB : (savedRGB ?? d.vec3f(0, 0, 0)))}
 				</div>
+				{#each savedColors as savedColor, i (i)}
+					<button
+						class="saved-swatch"
+						style="background-color: {rgbToHexColor(savedColor)}"
+						title="{rgbToHexColor(savedColor)} (click to remove)"
+						aria-label="Remove saved color {rgbToHexColor(savedColor)}"
+						onclick={() => removeSavedColor(i)}
+					></button>
+				{/each}
 			</div>
 			<div class="controls">
 				<label class="file-label">
@@ -642,7 +676,7 @@
 				</label>
 				<div class="presets">
 					<span class="preset-label">Presets:</span>
-					{#each presets as preset}
+					{#each presets as preset (preset.name)}
 						<button class="btn preset-btn" onclick={() => loadPreset(preset)}>{preset.name}</button>
 					{/each}
 				</div>
@@ -673,7 +707,7 @@
 							class="relative flex w-full touch-none items-center select-none"
 							onValueChange={(v) => {
 								sensitivitySlider = v;
-								onUpdate();
+								onCloudUpdate();
 								invalidateCaches();
 							}}
 						>
@@ -704,8 +738,37 @@
 							class="relative flex w-full touch-none items-center select-none"
 							onValueChange={(v) => {
 								bgColor = v;
-								onUpdate();
+								onCloudUpdate();
 								invalidateCaches();
+							}}
+						>
+							<span
+								class="relative h-2 w-full grow cursor-pointer overflow-hidden rounded-full bg-white/20"
+							>
+								<Slider.Range class="absolute h-full bg-blue-600" />
+							</span>
+							<Slider.Thumb
+								index={0}
+								class="block size-[20px] cursor-pointer rounded-full border-2 border-blue-600 bg-white shadow-sm transition-colors hover:border-white/30 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50 data-active:scale-[0.98] data-active:border-white/30"
+							/>
+						</Slider.Root>
+					</div>
+				</div>
+
+				<div class="flex w-full flex-col gap-1">
+					<div class="pl-8 text-sm text-slate-400">
+						<span>Color Threshold</span>
+					</div>
+					<div class="flex items-center gap-2">
+						<CrosshairIcon size={24} class="text-slate-400" />
+						<Slider.Root
+							type="single"
+							value={colorThreshold}
+							max={0.3}
+							step={0.005}
+							class="relative flex w-full touch-none items-center select-none"
+							onValueChange={(v) => {
+								colorThreshold = v;
 							}}
 						>
 							<span
@@ -782,7 +845,7 @@
 								const encoder = gpuState.root.device.createCommandEncoder();
 								invalidateCaches();
 								computeWeightTexture(tableSize);
-								updated = Date.now();
+								onCloudUpdate();
 								gpuState.root.device.queue.submit([encoder.finish()]);
 							}
 						}}
@@ -829,6 +892,18 @@
 						</Select.Portal>
 					</Select.Root>
 				</div>
+
+				<label class="flex cursor-pointer items-center gap-2 text-slate-200 select-none">
+					<input
+						type="checkbox"
+						class="size-4 cursor-pointer accent-blue-600"
+						bind:checked={sphereLighting}
+						onchange={() => {
+							onCloudUpdate();
+						}}
+					/>
+					Sphere lighting
+				</label>
 			</div>
 
 			<!-- Right Column: Image Filters -->
@@ -984,6 +1059,16 @@
 		padding: 8px 12px 8px 12px;
 	}
 
+	.saved-swatch {
+		width: 28px;
+		height: 28px;
+		border-radius: 8px;
+		border: 2px solid rgba(255, 255, 255, 0.8);
+		box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+		cursor: pointer;
+		padding: 0;
+	}
+
 	canvas {
 		display: block;
 		border-radius: 8px;
@@ -992,20 +1077,6 @@
 		max-width: 800px;
 		height: 300px;
 		aspect-ratio: 4/3;
-	}
-
-	.radio-group {
-		display: flex;
-		gap: 1rem;
-		align-items: center;
-		margin-top: 1rem;
-	}
-
-	.radio-group label {
-		display: flex;
-		align-items: center;
-		gap: 0.25rem;
-		cursor: pointer;
 	}
 
 	.controls {
